@@ -290,10 +290,71 @@ class TestBounds(unittest.TestCase):
     def test_oversized_response_is_answered_but_not_cached(self):
         cache = DedupCache(max_entries=10, max_bytes=5)
         frame = b"0123456789" * 2  # 20 bytes, > 5
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return frame
+
+        self.assertEqual(cache.run(1, fp(1), compute), frame)
+        self.assertEqual(cache.bytes_used, 0)
+        self.assertEqual(len(cache), 0)
+        self.assertIsNone(cache.replay(1))
+        self.assertEqual(cache.oversized, 1)
+        # A later retry re-executes because the oversized frame was not retained.
+        self.assertEqual(cache.run(1, fp(1), compute), frame)
+        self.assertEqual(len(calls), 2)
+
+    def test_oversized_responses_max_bytes_zero(self):
+        cache = DedupCache(max_entries=5, max_bytes=0)
+        frame = b"not empty"
         self.assertEqual(cache.run(1, fp(1), lambda: frame), frame)
+        self.assertEqual(len(cache), 0)
         self.assertEqual(cache.bytes_used, 0)
         self.assertIsNone(cache.replay(1))
         self.assertEqual(cache.oversized, 1)
+
+    def test_oversized_responses_do_not_fill_the_slot_map(self):
+        cache = DedupCache(max_entries=2, max_bytes=5)
+        frame = b"!" * 10
+        for rid in range(5):
+            self.assertEqual(cache.run(rid, fp(rid), lambda: frame), frame)
+        self.assertEqual(len(cache), 0)
+        self.assertEqual(cache.oversized, 5)
+
+    def test_oversized_concurrent_duplicates_share_the_first_result(self):
+        cache = DedupCache(max_entries=5, max_bytes=5)
+        running = threading.Event()
+        release = threading.Event()
+        calls = []
+        frame = b"!" * 10
+
+        def compute():
+            calls.append(1)
+            running.set()
+            release.wait(10)
+            return frame
+
+        first = []
+        worker = threading.Thread(
+            target=lambda: first.append(cache.run(9, fp(9), compute)))
+        worker.start()
+        self.assertTrue(running.wait(10))
+        second = []
+        waiter = threading.Thread(
+            target=lambda: second.append(
+                cache.run(9, fp(9), compute, timeout=10)))
+        waiter.start()
+        release.set()
+        worker.join(10)
+        waiter.join(10)
+        self.assertEqual(first, [frame])
+        self.assertEqual(second, [frame])
+        self.assertEqual(len(calls), 1)
+        # After completion the oversized slot is gone; a retry re-executes.
+        self.assertEqual(cache.run(9, fp(9), compute), frame)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(cache), 0)
 
     def test_an_expired_entry_is_dropped_and_re_executed(self):
         cache = DedupCache(max_entries=8, ttl=0.01)

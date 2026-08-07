@@ -337,19 +337,18 @@ included. The three process tiers are started like this:
 | Tier | Command |
 |---|---|
 | console | `build/expert_node_host expert.exp <port>` (real hardware), or `python3 tools/run_expert.py expert.exp --port <port>` — the numpy reference worker, `--identity` for a trivial expert |
-| head server | `python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000`; `--host`/`--port` override the config, `--standby N` serves the head's Nth extra address, `--timeout` sets the downstream budget in seconds, `--attempts` the tries per expert, `--retry-on-timeout` / `--retry-on-disconnect` / `--retry-on-node-error` opt into wider expert-link retry (default = safe failures only), `--dedup-entries` / `--dedup-ttl` / `--dedup-bytes` bound the replay cache, `--refuse-fast` rejects approximate batches with `ERR_BAD_REQUEST`, `--list` and `--check-members` inspect without serving |
+| head server | `python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000`; `--host`/`--port` override the config, `--standby N` starts an independent process on the head's Nth extra address, `--timeout` sets the downstream budget in seconds, `--attempts` the tries per expert, `--retry-on-timeout` / `--retry-on-disconnect` / `--retry-on-node-error` opt into wider expert-link retry (default = safe failures only), `--dedup-entries` / `--dedup-ttl` / `--dedup-bytes` bound the replay cache, `--refuse-fast` rejects approximate batches with `ERR_BAD_REQUEST`, `--list` and `--check-members` inspect without serving |
 | layer | `python3 tools/run_layer.py --config cluster.json --layer L --token T --experts e0 e1 --gates g0 g1 --activation x.npy --output y.npy` or any process holding a `SubclusterTransport` + `HierarchicalExpertDispatcher` over the same `cluster.json` (see `ps3-cluster/README.md`) |
 
 `tools/gen_cluster_config.py` writes the config for one layer (`--experts`,
 `--size`, `--expert-host`/`--expert-port-base`, `--head-host`/`--head-port-base`,
-and `--head-standby N`/`--head-standby-host` for the extra head addresses that
-`--standby` serves; `--regions`/`--region-host`/`--region-port-base` and
-`--region-standby N`/`--region-standby-host` do the same one tier up). Standby
-ports are the next block after the primaries on the same host — usable as
-generated on one machine, and a starting point for a farm, where the hosts should
-be edited so a standby does not share a machine with the primary it covers.
-A head server exits cleanly on SIGINT/SIGTERM, reporting how many batches it
-served.
+and `--head-standby N`/`--head-standby-host` for the extra head addresses an
+independent `--standby` process can listen on; `--regions`/`--region-host`/`--region-port-base`
+and `--region-standby N`/`--region-standby-host` do the same one tier up).
+Standby ports allocate in the next block after primaries on the same host by
+default — fine for a single-machine bring-up, but for a production farm assign
+them to a different host than the primary they cover. A head server exits cleanly
+on SIGINT/SIGTERM, reporting how many batches it served.
 
 ### Regional coordinators: the same tier, one level up
 
@@ -398,9 +397,12 @@ after an explicit ping/check_liveness or an observed request failure; it is not
 a background monitor. An endpoint marked dead is sorted last, never removed, so
 a wrongly-marked or never-probed address is still tried when it is the only one
 left — correctness never depends on health state.
-Head servers and regions keep no durable/shared state, so a standby is just
-another listener on the same `cluster.json` (`--standby N`); per-process bounded
-dedup/health caches are ephemeral and do not span primaries and standbys.
+Head servers and regions keep bounded ephemeral in-memory state (per-process
+dedup/health caches), so they are not stateless, but they keep no durable/shared
+state. A `--standby N` process is an independent process that uses the same
+`cluster.json`; it does not share the primary's cache. Same-process deduplication
+only happens when a single process listens on multiple addresses programmatically,
+or when a dropped socket reconnects to the same process.
 
 **Request identity.** Each batch carries a 64-bit id (`next_request_id()`:
 process-random high bits + a counter, so two layer coordinators cannot mint the
@@ -444,14 +446,14 @@ it is documented rather than papered over.
 
 | Tier | Command |
 |---|---|
-| region | `python3 tools/run_region.py --config cluster.json --region rg-0000`; `--standby N` serves the region's Nth extra address, `--attempts`/`--retry-ambiguous` set the layer->region link policy, `--dedup-entries` / `--dedup-ttl` / `--dedup-bytes` bound the replay cache, `--refuse-fast` rejects approximate batches, `--list`/`--check-members` inspect without serving |
+| region | `python3 tools/run_region.py --config cluster.json --region rg-0000`; `--standby N` starts an independent process on the region's Nth extra address, `--attempts`/`--retry-ambiguous` set the layer->region link policy, `--dedup-entries` / `--dedup-ttl` / `--dedup-bytes` bound the replay cache, `--refuse-fast` rejects approximate batches, `--list`/`--check-members` inspect without serving |
 | layer | `python3 tools/run_layer.py --config cluster.json ...` or `SubclusterTransport(config.region_endpoints())` + `HierarchicalExpertDispatcher(config.placement(), config.tiered_plan(), transport)` |
 
 `tools/gen_cluster_config.py --regions N --region-host … --region-port-base …`
 writes the three-tier config, dealing heads out contiguously so a token's top-k
 lands in few regions; add `--region-standby N` (and `--head-standby N`) for the
-extra addresses `--standby` serves, or `--standby N` exits with `rg-0000 has 0
-standby addresses, no index 0`. `tests/test_deployment_cli.py` brings the whole
+extra addresses an independent `--standby` process can listen on, or `--standby N`
+exits with `rg-0000 has 0 standby addresses, no index N`. `tests/test_deployment_cli.py` brings the whole
 thing up as real processes through these CLIs and compares against the flat
 dispatcher.
 
@@ -551,10 +553,9 @@ multiple passes on real hardware; the host driver is structured to allow that.
     ~16 MB/s, so it is useless for weights read every token — cold storage at
     best. XDR stays the binding constraint and placement stays 1 expert/node.
   - Under a **GameOS exploit (AsbestOS)** you get full ~22.4 GB/s access *and*
-    the programmable NV47/G70 shader pipeline, making RSX a genuine hot tier: a
-    node can hold ~2 experts (one in XDR, one in RSX) and could even run the
-    expert GEMV as RSX fragment shaders instead of on the SPEs. The planner
-    models this with `plan_cluster(..., rsx=True)` /
+    the programmable NV47/G70 shader pipeline, making RSX a genuine hot tier:
+    the combined ~440 MB hot budget lets a node hold roughly 20-25 K3-sized
+    packed experts. The planner models this with `plan_cluster(..., rsx=True)` /
     `tools/plan_k3.py --rsx`, which widens per-node capacity (200 → 440 MB) and
     reports how many experts fit; packing is opt-in via `experts_per_node` so
     the default stays the canonical 1-expert/node design.

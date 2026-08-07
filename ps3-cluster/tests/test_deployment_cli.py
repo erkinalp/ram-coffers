@@ -319,20 +319,46 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
 
     def test_run_layer_cli_ping_reports_coordinators(self):
         path, config = self._config()
-        x_path = os.path.join(self.tmp.name, "x3.npy")
-        out_path = os.path.join(self.tmp.name, "out3.npy")
-        np.save(x_path, np.ones(HIDDEN, dtype=np.float32))
         with _Processes() as procs:
             self._bring_up(procs, path, config)
             _wait_for_coordinators(config)
             result = _run_checked(
                 [sys.executable, os.path.join(TOOLS, "run_layer.py"),
-                 "--config", path, "--layer", str(LAYER), "--token", "1",
-                 "--experts", "0", "--gates", "1.0",
-                 "--activation", x_path, "--output", out_path, "--ping",
-                 "--timeout", "10"])
+                 "--config", path, "--ping", "--timeout", "10"])
             for region_id in config.region_ids():
-                self.assertIn(region_id, result.stdout)
+                self.assertIn(region_id + "\tup", result.stdout)
+            self.assertNotIn("down", result.stdout)
+
+    def test_run_layer_ping_is_standalone_two_tier(self):
+        path = os.path.join(self.tmp.name, "two-tier-ping.json")
+        _run_checked(
+            [sys.executable, os.path.join(TOOLS, "gen_cluster_config.py"),
+             "--layer", str(LAYER), "--experts", str(N_EXPERTS),
+             "--size", "1", "--expert-host", "127.0.0.1",
+             "--head-host", "127.0.0.1", "--head-port-base", str(free_port()),
+             "-o", path])
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        for spec, port in zip(doc["subclusters"], self.expert_ports):
+            spec["members"][0]["port"] = port
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        config = ClusterConfig.from_dict(doc)
+        with _Processes() as procs:
+            for expert, port in enumerate(self.expert_ports):
+                procs.start([os.path.join(TOOLS, "run_expert.py"),
+                             self.weights[expert][0], "--host", "127.0.0.1",
+                             "--port", str(port)])
+            for spec in config.subclusters:
+                procs.start([os.path.join(TOOLS, "run_subcluster.py"),
+                             "--config", path, "--subcluster", spec.group_id])
+            _wait_for_coordinators(config)
+            result = _run_checked(
+                [sys.executable, os.path.join(TOOLS, "run_layer.py"),
+                 "--config", path, "--ping", "--timeout", "10"])
+            for group_id in config.group_endpoints():
+                self.assertIn(group_id + "\tup", result.stdout)
+            self.assertNotIn("down", result.stdout)
 
     def test_a_two_tier_config_refuses_to_serve_a_region(self):
         path = os.path.join(self.tmp.name, "two-tier.json")

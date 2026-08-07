@@ -4,7 +4,9 @@
 This is a small operational client, not a full model shim. It loads the shared
 cluster config, builds the corresponding two- or three-tier dispatch plan, asks
 coordinators for weighted expert contributions, and reduces them exactly (or,
-with ``--fast``, approximately).
+with ``--fast``, approximately). With ``--ping`` it is a standalone readiness
+probe and does not need ``--experts``, ``--gates``, ``--activation`` or
+``--output``.
 
 Two-tier: layer -> heads -> consoles
 
@@ -18,6 +20,10 @@ Three-tier: layer -> regions -> heads -> consoles
         --experts 4 5 --gates 0.75 0.25 \
         --activation input.json --output out.json \
         --fast --retry-ambiguous
+
+Readiness probe:
+
+    python3 tools/run_layer.py --config cluster.json --ping [--timeout 10]
 
 ``--activation`` is either a ``.npy`` file or a JSON array. ``--output`` is
 written in the same format it was read, defaulting to JSON.
@@ -60,13 +66,13 @@ def main() -> int:
                     help="layer whose experts are selected")
     ap.add_argument("--token", type=int, default=1,
                     help="token id used for correlation")
-    ap.add_argument("--experts", type=int, nargs="+", required=True,
+    ap.add_argument("--experts", type=int, nargs="+", default=None,
                     help="expert ids in top-k order")
-    ap.add_argument("--gates", type=float, nargs="+", required=True,
+    ap.add_argument("--gates", type=float, nargs="+", default=None,
                     help="gate weight for each --experts entry")
-    ap.add_argument("--activation", required=True,
+    ap.add_argument("--activation", default=None,
                     help="input vector (.npy or JSON array)")
-    ap.add_argument("--output", required=True,
+    ap.add_argument("--output", default=None,
                     help="where to write the resulting vector")
     ap.add_argument("--fast", action="store_true",
                     help="ask each coordinator for one partial sum (not exact)")
@@ -83,13 +89,20 @@ def main() -> int:
                     help="PING all coordinators and exit without running")
     args = ap.parse_args()
 
-    if len(args.experts) != len(args.gates):
-        ap.error("--experts and --gates must have the same length")
+    if not args.ping:
+        if args.experts is None or args.gates is None:
+            ap.error("--experts and --gates are required unless --ping")
+        if args.activation is None or args.output is None:
+            ap.error("--activation and --output are required unless --ping")
+        if len(args.experts) != len(args.gates):
+            ap.error("--experts and --gates must have the same length")
 
     config = ClusterConfig.load(args.config)
-    x = _read_activation(args.activation)
-    if x.dtype != np.float32:
-        x = x.astype(np.float32)
+    x = None
+    if not args.ping:
+        x = _read_activation(args.activation)
+        if x.dtype != np.float32:
+            x = x.astype(np.float32)
 
     if config.regions:
         plan = config.tiered_plan()
