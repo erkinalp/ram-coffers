@@ -27,6 +27,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
 
 #include "../common/mxfp4.h"
 #include "../common/p3xc.h"
@@ -190,21 +192,41 @@ static int recv_exact(int fd, void *buf, size_t n) {
     return 0;
 }
 
-static void handle_conn(int fd, const expert_t *e) {
+static int send_all(int fd, const uint8_t *buf, size_t n) {
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t w = send(fd, buf + sent, n - sent, 0);
+        if (w <= 0) return -1;
+        sent += (size_t)w;
+    }
+    return 0;
+}
+
+/* Handle one frame. Returns 0 to keep the connection open, -1 to close it. */
+static int handle_frame(int fd, const expert_t *e) {
     uint8_t lenbuf[4];
-    if (recv_exact(fd, lenbuf, 4) < 0) return;
+    if (recv_exact(fd, lenbuf, 4) < 0) return -1;
     uint32_t body_len = ntohl(*(uint32_t *)lenbuf);
-    if (body_len == 0 || body_len > (1u << 26)) return;
+    if (body_len == 0 || body_len > (1u << 26)) return -1;
     uint8_t *body = (uint8_t *)malloc(body_len);
-    if (!body) return;
-    if (recv_exact(fd, body, body_len) < 0) { free(body); return; }
+    if (!body) return -1;
+    if (recv_exact(fd, body, body_len) < 0) { free(body); return -1; }
 
     p3xc_hdr_t hdr;
     long off = p3xc_parse(body, body_len, &hdr);
-    if (off < 0) { free(body); return; }
+    if (off < 0) { free(body); return -1; }
 
+    int rc = 0;
     uint8_t *resp = NULL;
-    if (hdr.msg_type == P3XC_REQ &&
+    if (hdr.msg_type == P3XC_PING) {
+        /* Heartbeat: echo the coordinator's token so it can correlate the
+         * PONG with its probe, and report our own (layer, expert). */
+        float z = 0.0f;
+        resp = (uint8_t *)malloc(64);
+        uint32_t total = p3xc_write_f32(resp, P3XC_PONG, e->layer, e->expert,
+                                        hdr.token_id, &z, 1);
+        rc = send_all(fd, resp, total);
+    } else if (hdr.msg_type == P3XC_REQ &&
         hdr.layer == e->layer && hdr.expert == e->expert &&
         hdr.count == e->hidden) {
         float *x = (float *)malloc(sizeof(float) * hdr.count);
@@ -215,17 +237,28 @@ static void handle_conn(int fd, const expert_t *e) {
         resp = (uint8_t *)malloc(64 + 4 * (size_t)e->hidden);
         uint32_t total = p3xc_write_f32(resp, P3XC_RSP, e->layer, e->expert,
                                         hdr.token_id, y, e->hidden);
-        send(fd, resp, total, 0);
+        rc = send_all(fd, resp, total);
         free(x); free(y);
     } else {
         float z = 0.0f;
         resp = (uint8_t *)malloc(64);
         uint32_t total = p3xc_write_f32(resp, P3XC_ERR, e->layer, e->expert,
                                         hdr.token_id, &z, 1);
-        send(fd, resp, total, 0);
+        rc = send_all(fd, resp, total);
     }
     free(resp);
     free(body);
+    return rc;
+}
+
+/* Serve a persistent connection: keep answering frames until the coordinator
+ * closes it (or a write fails). The pooled coordinator transport holds one
+ * connection per node open for the whole run, so a connection carries many
+ * requests; they are answered in arrival order on this socket, while distinct
+ * connections are served by distinct forked workers. */
+static void handle_conn(int fd, const expert_t *e) {
+    while (handle_frame(fd, e) == 0)
+        ;
 }
 
 int main(int argc, char **argv) {
@@ -257,10 +290,28 @@ int main(int argc, char **argv) {
     listen(srv, 16);
     fprintf(stderr, "serving P3XC on port %d\n", port);
 
+    /* Reap connection workers automatically; we never wait() on them. */
+    signal(SIGCHLD, SIG_IGN);
+    /* A dead coordinator must not kill the node on write. */
+    signal(SIGPIPE, SIG_IGN);
+
     for (;;) {
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;
-        handle_conn(fd, &e);
+        /* One process per persistent connection: the pooled coordinator keeps
+         * several connections open at once, so the accept loop must not block
+         * on a single one. fork() shares the resident MXFP4 weights
+         * copy-on-write, and they are only ever read, so no console RAM is
+         * duplicated. */
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(srv);
+            handle_conn(fd, &e);
+            close(fd);
+            _exit(0);
+        }
+        if (pid < 0)         /* out of processes: serve it inline */
+            handle_conn(fd, &e);
         close(fd);
     }
     free(e.blob);
