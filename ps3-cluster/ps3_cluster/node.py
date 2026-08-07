@@ -47,29 +47,55 @@ class ExpertNode:
 
 
 class _Handler(socketserver.BaseRequestHandler):
+    """Serves a *persistent* connection: frames are read until the peer closes.
+
+    The coordinator's pooled transport keeps one connection per node open for
+    the life of the run and may have several requests in flight on it, so the
+    worker must not treat one frame as one connection. Requests on a single
+    connection are handled sequentially (a PS3's SPEs are already saturated by
+    one expert GEMV), while the server itself is threaded, so a node with
+    several pooled connections works on them in parallel.
+    """
+
     def handle(self) -> None:
         node: ExpertNode = self.server.expert_node  # type: ignore[attr-defined]
+        while True:
+            try:
+                msg = read_frame(self.request.recv)
+            except (ProtocolError, OSError):
+                return  # peer closed, or a malformed frame: drop the socket
+            if not self._handle_one(node, msg):
+                return
+
+    def _handle_one(self, node: ExpertNode, msg: dict) -> bool:
+        """Answer one frame. Returns False to close the connection."""
         try:
-            msg = read_frame(self.request.recv)
-        except ProtocolError:
-            return
-        if msg["msg_type"] == MSG_PING:
-            self.request.sendall(encode(MSG_PONG, node.layer, node.expert,
-                                        msg["token_id"], np.zeros(1, np.float32)))
-            return
-        if msg["msg_type"] != MSG_REQ:
-            return
-        if (msg["layer"], msg["expert"]) != (node.layer, node.expert):
-            self.request.sendall(encode(MSG_ERR, node.layer, node.expert,
-                                        msg["token_id"], np.zeros(1, np.float32)))
-            return
-        try:
-            y = node.forward(msg["array"])
-            self.request.sendall(encode(MSG_RSP, node.layer, node.expert,
-                                        msg["token_id"], y))
-        except Exception:
-            self.request.sendall(encode(MSG_ERR, node.layer, node.expert,
-                                        msg["token_id"], np.zeros(1, np.float32)))
+            if msg["msg_type"] == MSG_PING:
+                # Heartbeat: answered on the same connection, interleaved with
+                # expert work, so liveness does not need a second channel.
+                self._send(encode(MSG_PONG, node.layer, node.expert,
+                                  msg["token_id"], np.zeros(1, np.float32)))
+                return True
+            if msg["msg_type"] != MSG_REQ:
+                return False
+            if (msg["layer"], msg["expert"]) != (node.layer, node.expert):
+                self._send(encode(MSG_ERR, node.layer, node.expert,
+                                  msg["token_id"], np.zeros(1, np.float32)))
+                return True
+            try:
+                y = node.forward(msg["array"])
+            except Exception:
+                self._send(encode(MSG_ERR, node.layer, node.expert,
+                                  msg["token_id"], np.zeros(1, np.float32)))
+                return True
+            self._send(encode(MSG_RSP, node.layer, node.expert,
+                              msg["token_id"], y))
+            return True
+        except OSError:
+            return False
+
+    def _send(self, frame: bytes) -> None:
+        self.request.sendall(frame)
 
 
 class ExpertServer(socketserver.ThreadingTCPServer):
