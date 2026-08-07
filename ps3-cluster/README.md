@@ -94,12 +94,23 @@ layer coordinator ── BREQ (activation once + [(expert, gate)…]) ──▶ 
                                         P3XC REQ/RSP, pooled, concurrent
 ```
 
-Run a head server per subcluster from one shared config file:
+Bring a farm up from one shared config file. Each console runs a worker —
+`build/expert_node_host expert.exp <port>` on real hardware, or its numpy
+counterpart `tools/run_expert.py` when there is no Cell toolchain — and each
+subcluster runs one head server:
 
 ```bash
 python3 tools/gen_cluster_config.py --layer 3 --experts 44 \
     --expert-host 10.0.0.10 --head-host 10.0.1.1 -o cluster.json   # 2 × 22
+
+# on each console (port from cluster.json; --identity skips the .exp file)
+python3 tools/pack_expert.py L003-E0000.exp --layer 3 --expert 0
+python3 tools/run_expert.py L003-E0000.exp --port 9000
+
+# on each head server; --host/--port override the config, --timeout sets the
+# downstream budget in seconds and --attempts the retry count per expert
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
+python3 tools/run_subcluster.py --config cluster.json --list
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
     --check-members                      # PING every console behind this head
 ```

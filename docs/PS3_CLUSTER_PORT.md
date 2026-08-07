@@ -288,10 +288,19 @@ disagree about who owns an expert:
 
 `ClusterConfig` derives the canonical placement (replicas additive, never extra
 experts), the console endpoints, the head endpoints, and a `SubclusterPlan` built
-from the *declared* membership. `tools/gen_cluster_config.py` writes such a file
-for a layer, and `tools/run_subcluster.py --config … --subcluster sc-0000` runs
-one head server (`--list`, `--check-members` for inspection). No MPI, no external
-runtime; CPU-only hosts included.
+from the *declared* membership. No MPI, no external runtime; CPU-only hosts
+included. The three process tiers are started like this:
+
+| Tier | Command |
+|---|---|
+| console | `build/expert_node_host expert.exp <port>` (real hardware), or `python3 tools/run_expert.py expert.exp --port <port>` — the numpy reference worker, `--identity` for a trivial expert |
+| head server | `python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000`; `--host`/`--port` override the config, `--timeout` sets the downstream budget in seconds, `--attempts` the retries per expert, `--list` and `--check-members` inspect without serving |
+| layer | any process holding a `SubclusterTransport` + `HierarchicalExpertDispatcher` over the same `cluster.json` (see `ps3-cluster/README.md`) |
+
+`tools/gen_cluster_config.py` writes the config for one layer (`--experts`,
+`--size`, `--expert-host`/`--expert-port-base`, `--head-host`/`--head-port-base`).
+A head server exits cleanly on SIGINT/SIGTERM, reporting how many batches it
+served.
 
 ### Failure semantics
 
