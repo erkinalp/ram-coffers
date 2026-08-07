@@ -1,17 +1,21 @@
-"""Subcluster wire frames: one activation, many experts, one partial sum.
+"""Subcluster wire frames: one activation, many experts, per-expert rows.
 
 A layer coordinator talking to a *subcluster coordinator* has a different
 message shape than one talking to an expert node. All experts a token routes to
 inside one subcluster receive the **same** activation, so sending an expert-node
 REQ per expert would put the activation on the wire k times: at K3 width
 (hidden 7168, fp32) that is 28 KB per expert, and a top-4-within-subcluster pick
-would waste 84 KB of a console farm's 100 Mbit uplink per token per layer. The
-batched request instead carries the activation **once** plus a compact
-``(expert, gate)`` list, and the subcluster answers with a single partial sum —
-which is exactly what Condor's coordinating servers did for their 22 consoles
-(Barnell et al., IEEE HPEC 2012) and how ALF's host pushes one work block
-descriptor list rather than one message per accelerator (ALF Programmer's Guide,
-SDK 3.0).
+would waste 84 KB of a console farm's Gigabit Ethernet link per token per layer
+(real OtherOS/application throughput is unmeasured here). The batched request
+instead carries the activation **once** plus a compact ``(expert, gate)`` list.
+The default response is one weighted row per selected expert, tagged with its
+expert id and accumulated by the layer in top-k order so the hierarchy is
+bit-identical to the flat dispatcher. A single partial sum is returned only when
+the caller explicitly sets ``REQ_FLAG_FAST``. The Condor-style 22-console
+subcluster grouping (Barnell et al., IEEE HPEC 2012) and ALF's host pushing one
+work-block descriptor list rather than one message per accelerator (ALF
+Programmer's Guide, SDK 3.0) motivate the shared-activation framing; neither
+paper prescribes the exact or fast reduction used here.
 
 Frames reuse the P3XC header and array payload verbatim (``protocol.encode``
 with a trailer), so the format stays fixed big-endian and length-prefixed, and
