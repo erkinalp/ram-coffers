@@ -33,57 +33,137 @@ positions interleave across subclusters, so results are reproducible yet *not*
 bit-identical, and the resulting logit differences can change which token is
 sampled. It is never the default; see ``docs/PS3_CLUSTER_PORT.md``.
 
+Tiers
+-----
+The downstream peer is a *coordinator*, not necessarily a subcluster head: point
+this at regional coordinators with a :class:`~.subcluster.TieredPlan` and the
+same code drives a three-tier tree (layer -> region -> subcluster -> console).
+The rows come back tagged by expert either way, so bit identity does not care
+how many tiers they crossed.
+
 Failure semantics
 -----------------
-A subcluster either delivers every expert it was asked for or answers ``BERR``.
+A coordinator either delivers every expert it was asked for or answers ``BERR``.
 The stage therefore raises :class:`~.errors.SubclusterError` — naming the
 failed experts and their consoles — rather than reducing a token through fewer
 experts than the router chose. Whether to retry is the layer's decision:
 ``SubclusterError.safe_to_retry`` is true only when no expert can have run.
+
+Link failover and retry
+-----------------------
+A logical coordinator may be configured with an ordered endpoint list (primary
+first). Two things then protect a batch from a dead head:
+
+* *Connection* failover, inside one attempt: opening a connection walks the list,
+  so a refused primary costs a connect (``transport.py``).
+* *Request* retry, across attempts, driven by :class:`LinkRetryPolicy`. The two
+  failure classes are deliberately not treated alike:
+
+  - **Safe before send** — no endpoint accepted, the pool was exhausted, or the
+    write itself failed. P3XC frames are length-prefixed, so a partially written
+    frame is never executed: nothing downstream ran, and retrying is free of
+    consequence. Retried by default.
+  - **Ambiguous** — the frame went out and then the answer did not come back
+    (timeout, or the peer closed). The head may have driven all 22 consoles and
+    died before replying. Retrying is therefore **at-least-once execution**, so
+    it happens only with ``retry_ambiguous=True``.
+
+Either way reduction is exactly once. Each attempt carries the same 64-bit
+request id, so a retry that reaches the same coordinator process replays the
+first attempt's answer from its dedup cache (``dedup.py``); an abandoned attempt
+is cancelled, which retires its correlation key so a late reply is dropped rather
+than reduced; and a reply whose echoed request id is not the one being awaited is
+rejected outright.
 """
 
 from __future__ import annotations
 
 import itertools
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .batch import (ERR_UNKNOWN, MSG_BERR, MSG_BRSP, BatchEntry,
+from .batch import (ERR_UNKNOWN, MAX_REQUEST_ID, MSG_BERR, MSG_BRSP, BatchEntry,
                     encode_batch_request, parse_batch_error,
                     parse_batch_response, NO_EXPERT)
 from .dispatch import DEFAULT_FANOUT_WORKERS, ExpertPlacement
 from .errors import NodeDisconnected, SubclusterError, TransportError
 from .protocol import ProtocolError
-from .subcluster import SubclusterPlan
+from .subcluster import GroupingPlan
 from .transport import (DEFAULT_POOL_SIZE, DEFAULT_TIMEOUT, Endpoint,
-                        PersistentSocketTransport)
+                        EndpointSpec, PersistentSocketTransport)
+
+#: Process-unique high bits, so two layer coordinators talking to one head server
+#: cannot mint the same request id and dedup each other's batches.
+_ID_SALT = random.getrandbits(24) << 40
+_ID_COUNTER = itertools.count(1)
+
+
+def next_request_id() -> int:
+    """A fresh 64-bit id naming one logical batch, retries included."""
+    return (_ID_SALT | (next(_ID_COUNTER) & 0xFFFFFFFFFF)) & MAX_REQUEST_ID
+
+
+class LinkRetryPolicy(NamedTuple):
+    """How hard to retry one coordinator link, and how much risk to accept.
+
+    ``attempts`` counts total attempts per logical batch (``1`` disables retry).
+    ``retry_ambiguous`` opts into retrying a batch that may already be running
+    downstream, which is at-least-once *execution*; reduction stays exactly once.
+    """
+
+    attempts: int = 2
+    retry_safe: bool = True
+    retry_ambiguous: bool = False
 
 
 class PendingBatch:
     """One batched subcluster request in flight."""
 
-    __slots__ = ("group_id", "entries", "positions", "fast", "_frame")
+    __slots__ = ("group_id", "entries", "positions", "fast", "request_id",
+                 "_frame")
 
     def __init__(self, group_id: str, entries: Sequence[BatchEntry],
-                 positions: Sequence[int], frame, fast: bool = False):
+                 positions: Sequence[int], frame, fast: bool = False,
+                 request_id: Optional[int] = None):
         self.group_id = group_id
         self.entries = list(entries)
         #: The layer's top-k position each entry came from, entry order.
         self.positions = list(positions)
         self.fast = fast
+        #: The id this attempt carried, reused by a retry of the same batch.
+        self.request_id = request_id
         self._frame = frame
 
     def done(self) -> bool:
         return self._frame.done()
 
+    @property
+    def endpoint(self) -> Endpoint:
+        """Which endpoint of the coordinator this attempt went to."""
+        return self._frame.endpoint
+
+    def _check_id(self, answered: Optional[int]) -> None:
+        """Refuse an answer that names a different logical batch.
+
+        A peer that does not echo ids at all (``None``) is accepted: correlation
+        then rests on ``(layer, token_id)`` as it did before ids existed.
+        """
+        if (self.request_id is not None and answered is not None
+                and answered != self.request_id):
+            raise SubclusterError(
+                self.group_id, ERR_UNKNOWN, (),
+                f"answer carries request id {answered}, not {self.request_id}")
+
     def _response(self, timeout: Optional[float]) -> dict:
         msg = self._frame.message(timeout)
         if msg["msg_type"] == MSG_BERR:
             err = parse_batch_error(msg)
+            self._check_id(err["request_id"])
             raise SubclusterError(self.group_id, err["code"], err["failures"],
                                   err["detail"])
         if msg["msg_type"] != MSG_BRSP:
@@ -94,6 +174,7 @@ class PendingBatch:
         except ProtocolError as exc:
             raise SubclusterError(self.group_id, ERR_UNKNOWN, (),
                                   str(exc)) from exc
+        self._check_id(rsp["request_id"])
         if rsp["n_reduced"] != len(self.entries):
             # Refuse an answer that does not cover the whole request: a missing
             # expert must be an error, never a quietly smaller sum.
@@ -157,18 +238,33 @@ class SubclusterTransport:
     order.
     """
 
-    def __init__(self, group_endpoints: Dict[str, Endpoint],
+    def __init__(self, group_endpoints: Dict[str, EndpointSpec],
                  timeout: float = DEFAULT_TIMEOUT,
                  connect_timeout: Optional[float] = None,
-                 max_connections_per_group: int = DEFAULT_POOL_SIZE):
+                 max_connections_per_group: int = DEFAULT_POOL_SIZE,
+                 retry_policy: Optional[LinkRetryPolicy] = None):
         self.timeout = timeout
+        #: Default retry behaviour for :meth:`call_batch`.
+        self.retry_policy = (LinkRetryPolicy() if retry_policy is None
+                             else retry_policy)
         self._transport = PersistentSocketTransport(
             group_endpoints, timeout=timeout, connect_timeout=connect_timeout,
             max_connections_per_node=max_connections_per_group)
 
     # -- membership --------------------------------------------------------
-    def add_group(self, group_id: str, endpoint: Endpoint) -> None:
+    def add_group(self, group_id: str, endpoint: EndpointSpec) -> None:
+        """Register a head server: one endpoint, or primary-first replicas."""
         self._transport.add_endpoint(group_id, endpoint)
+
+    def endpoints_for(self, group_id: str) -> List[Endpoint]:
+        return self._transport.endpoints_for(group_id)
+
+    def mark_endpoint_dead(self, group_id: str, endpoint: Endpoint,
+                           cooldown: Optional[float] = None) -> None:
+        self._transport.mark_endpoint_dead(group_id, endpoint, cooldown)
+
+    def endpoint_healthy(self, group_id: str, endpoint: Endpoint) -> bool:
+        return self._transport.endpoint_healthy(group_id, endpoint)
 
     def connection_count(self, group_id: Optional[str] = None) -> int:
         return self._transport.connection_count(group_id)
@@ -181,21 +277,75 @@ class SubclusterTransport:
     def connects_opened(self) -> Dict[str, int]:
         return self._transport.connects_opened
 
+    @property
+    def connects_by_endpoint(self) -> Dict[Tuple[str, Endpoint], int]:
+        return self._transport.connects_by_endpoint
+
     # -- requests ----------------------------------------------------------
     def submit_batch(self, group_id: str, layer: int, token_id: int,
                      x: np.ndarray, entries: Sequence[BatchEntry],
                      deadline_ms: int = 0,
                      positions: Optional[Sequence[int]] = None,
-                     fast: bool = False) -> PendingBatch:
-        """Send one BREQ. ``fast`` asks for a partial sum instead of rows."""
+                     fast: bool = False,
+                     request_id: Optional[int] = None) -> PendingBatch:
+        """Send one BREQ. ``fast`` asks for a partial sum instead of rows.
+
+        ``request_id`` names the logical batch on the wire; pass the *same* id
+        again when retrying it so the coordinator can recognise the retry.
+        """
         frame = encode_batch_request(layer, token_id, x, entries,
-                                     deadline_ms=deadline_ms, fast=fast)
+                                     deadline_ms=deadline_ms, fast=fast,
+                                     request_id=request_id)
         key = (layer, NO_EXPERT, token_id)
         return PendingBatch(group_id, entries,
                             range(len(entries)) if positions is None
                             else positions,
                             self._transport.submit_raw(group_id, key, frame),
-                            fast=fast)
+                            fast=fast, request_id=request_id)
+
+    def call_batch(self, group_id: str, layer: int, token_id: int,
+                   x: np.ndarray, entries: Sequence[BatchEntry],
+                   positions: Optional[Sequence[int]] = None,
+                   deadline_ms: int = 0, timeout: Optional[float] = None,
+                   fast: bool = False,
+                   policy: Optional[LinkRetryPolicy] = None,
+                   request_id: Optional[int] = None):
+        """One batch through one logical coordinator, with link failover.
+
+        Returns the partial sum (fast) or ``{position: contribution}`` (exact).
+        Every attempt reuses one request id; an abandoned attempt is cancelled so
+        a late answer cannot be reduced. See the module docstring for which
+        failures are retried and why.
+        """
+        policy = self.retry_policy if policy is None else policy
+        if request_id is None:
+            request_id = next_request_id()
+        attempt = 0
+        while True:
+            attempt += 1
+            last = attempt >= policy.attempts
+            try:
+                pending = self.submit_batch(group_id, layer, token_id, x,
+                                            entries, deadline_ms,
+                                            positions=positions, fast=fast,
+                                            request_id=request_id)
+            except TransportError:
+                # Nothing was executed: no frame, or a partial one the peer
+                # cannot parse. Retrying costs only the round trip.
+                if last or not policy.retry_safe:
+                    raise
+                continue
+            try:
+                return (pending.partial(timeout) if fast
+                        else pending.contributions(timeout))
+            except SubclusterError:
+                raise  # the coordinator answered; retrying will not help
+            except TransportError:
+                # Ambiguous: the batch may be running downstream right now.
+                pending.cancel()
+                self.mark_endpoint_dead(group_id, pending.endpoint)
+                if last or not policy.retry_ambiguous:
+                    raise
 
     def run_batch(self, group_id: str, layer: int, token_id: int,
                   x: np.ndarray, entries: Sequence[BatchEntry],
@@ -208,11 +358,12 @@ class SubclusterTransport:
         instead, which re-associates the additions.
         """
         deadline_ms = 0 if timeout is None else max(1, int(timeout * 1000))
-        pending = self.submit_batch(group_id, layer, token_id, x, entries,
-                                    deadline_ms, fast=fast)
+        answer = self.call_batch(group_id, layer, token_id, x, entries,
+                                 deadline_ms=deadline_ms, timeout=timeout,
+                                 fast=fast)
         if fast:
-            return pending.partial(timeout)
-        contributions = pending.contributions(timeout)
+            return answer
+        contributions = answer
         ordered = sorted(contributions)
         out = contributions[ordered[0]]
         for position in ordered[1:]:
@@ -320,12 +471,18 @@ class HierarchicalExpertDispatcher:
     token's routing, sent concurrently, instead of one request per expert.
     """
 
-    def __init__(self, placement: ExpertPlacement, plan: SubclusterPlan,
+    def __init__(self, placement: ExpertPlacement, plan: GroupingPlan,
                  transport: SubclusterTransport,
-                 max_workers: Optional[int] = None, fast: bool = False):
+                 max_workers: Optional[int] = None, fast: bool = False,
+                 retry_policy: Optional[LinkRetryPolicy] = None):
         self.placement = placement
+        #: Any plan that can bucket console ids by the peer that fronts them: a
+        #: :class:`~.subcluster.SubclusterPlan` for two tiers, a
+        #: :class:`~.subcluster.TieredPlan` for three.
         self.plan = plan
         self.transport = transport
+        #: Retry behaviour for the link below this dispatcher.
+        self.retry_policy = retry_policy
         #: Opt-in throughput mode: one partial sum per subcluster, which
         #: re-associates the fp32 reduction and can change token choices.
         self.fast = fast
@@ -407,11 +564,11 @@ class HierarchicalExpertDispatcher:
                          x: np.ndarray, entries: List[BatchEntry],
                          positions: Sequence[int], deadline_ms: int,
                          timeout: Optional[float], fast: bool):
-        pending = self.transport.submit_batch(group_id, layer, token_id, x,
-                                              entries, deadline_ms,
-                                              positions=positions, fast=fast)
-        return pending.partial(timeout) if fast else pending.contributions(
-            timeout)
+        return self.transport.call_batch(group_id, layer, token_id, x, entries,
+                                         positions=positions,
+                                         deadline_ms=deadline_ms,
+                                         timeout=timeout, fast=fast,
+                                         policy=self.retry_policy)
 
     def run_expert_stage(self, layer: int, x: np.ndarray,
                          expert_ids: Sequence[int],

@@ -24,7 +24,8 @@ fixed plan but not bit-identical to the flat reduction; see
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (Callable, Dict, Iterable, List, Optional, Protocol,
+                    Sequence, Tuple)
 
 import numpy as np
 
@@ -78,6 +79,9 @@ class SubclusterPlan:
     def subcluster_of(self, node_id: str) -> str:
         return self._of_node[node_id]
 
+    def has_node(self, node_id: str) -> bool:
+        return node_id in self._of_node
+
     def same_subcluster(self, a: str, b: str) -> bool:
         return self._of_node[a] == self._of_node[b]
 
@@ -124,6 +128,86 @@ class SubclusterPlan:
                       prefix: str = "sc") -> "SubclusterPlan":
         """Build a plan over a placement's nodes (optionally one layer's)."""
         return cls(placement.node_ids(layer), size=size, prefix=prefix)
+
+
+class GroupingPlan(Protocol):
+    """What layer-side dispatch needs of a plan: node ids -> peer to call.
+
+    Both :class:`SubclusterPlan` (call the head server for these consoles) and
+    :class:`TieredPlan` (call the *region* that fronts those head servers)
+    satisfy it, which is why one dispatcher drives two or three tiers.
+    """
+
+    def group_ids(self) -> List[str]:
+        ...
+
+    def members(self, group_id: str) -> List[str]:
+        ...
+
+    def subcluster_of(self, node_id: str) -> str:
+        ...
+
+    def group_by_subcluster(
+            self, node_ids: Sequence[str]) -> List[Tuple[str, List[int]]]:
+        ...
+
+
+class TieredPlan:
+    """One more level of the tree: which *region* fronts which head servers.
+
+    Condor's heads were not the top of its tree — the subclusters sat behind
+    coordinating servers that the top level talked to (Barnell et al., IEEE HPEC
+    2012), which is the shape a Kimi-K3-sized farm needs: a layer that groups a
+    token's top-k by *region* sends a handful of batches instead of one per
+    22-console subcluster.
+
+    ``lower`` maps consoles to head servers; ``upper`` maps head-server ids to
+    region ids. The composition maps a console straight to the region a layer
+    should call, so :class:`~.hierarchy.HierarchicalExpertDispatcher` needs no
+    knowledge of how deep the tree is.
+    """
+
+    def __init__(self, lower: SubclusterPlan, upper: SubclusterPlan) -> None:
+        missing = [g for g in lower.group_ids() if not upper.has_node(g)]
+        if missing:
+            raise ValueError(f"subclusters {missing} are in no region")
+        self.lower = lower
+        self.upper = upper
+
+    @classmethod
+    def for_regions(cls, lower: SubclusterPlan,
+                    regions: Dict[str, Sequence[str]]) -> "TieredPlan":
+        """Build from declared ``region_id -> [subcluster ids]`` membership."""
+        size = max((len(heads) for heads in regions.values()), default=1)
+        upper = SubclusterPlan.from_groups(regions, size=size, prefix="rg")
+        return cls(lower, upper)
+
+    def __len__(self) -> int:
+        return len(self.upper)
+
+    def group_ids(self) -> List[str]:
+        return self.upper.group_ids()
+
+    def members(self, group_id: str) -> List[str]:
+        """The head servers in a region (its immediate downstream group)."""
+        return self.upper.members(group_id)
+
+    def nodes(self, group_id: str) -> List[str]:
+        """Every console under a region, head-server order."""
+        return [node for head in self.upper.members(group_id)
+                for node in self.lower.members(head)]
+
+    def subcluster_of(self, node_id: str) -> str:
+        """The region to call for a console. (Named for the plan protocol.)"""
+        return self.upper.subcluster_of(self.lower.subcluster_of(node_id))
+
+    def group_by_subcluster(
+            self, node_ids: Sequence[str]) -> List[Tuple[str, List[int]]]:
+        """Bucket positions in ``node_ids`` by region, group-id order."""
+        buckets: Dict[str, List[int]] = {}
+        for position, node_id in enumerate(node_ids):
+            buckets.setdefault(self.subcluster_of(node_id), []).append(position)
+        return [(g, buckets[g]) for g in sorted(buckets)]
 
 
 def partial_reduce(contributions: Dict[int, np.ndarray],

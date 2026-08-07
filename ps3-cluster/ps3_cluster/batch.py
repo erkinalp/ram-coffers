@@ -17,12 +17,20 @@ Frames reuse the P3XC header and array payload verbatim (``protocol.encode``
 with a trailer), so the format stays fixed big-endian and length-prefixed, and
 an expert worker's parser is untouched — it simply never receives these types.
 
-``BREQ`` (layer coordinator -> subcluster coordinator), ``msg_type=6``:
+The same frames address a *regional* coordinator: because every exact row is
+tagged with the expert it came from, and an expert id is unique within a layer, a
+coordinator can merge its downstream coordinators' rows and pass them up
+unchanged. The tier count is therefore invisible to the format — a regional head
+speaks BREQ upward and BREQ downward, which is why ``regional.py`` is a client of
+``hierarchy.py`` rather than a second protocol.
+
+``BREQ`` (caller -> coordinator), ``msg_type=6``:
 
     <P3XC header, expert=0xFFFF, array=activation>
     n_entries   : uint16                 <= MAX_BATCH_ENTRIES
-    flags       : uint16                 REQ_FLAG_FAST only; other bits must be 0
+    flags       : uint16                 REQ_FLAG_* below; other bits must be 0
     deadline_ms : uint32                 layer's budget, 0 = coordinator default
+    request_id  : uint64                 only if flags & REQ_FLAG_REQUEST_ID
     entries     : n_entries * {
         expert      : uint16
         replica     : uint8              replica index to prefer, 0 = primary
@@ -35,13 +43,15 @@ an expert worker's parser is untouched — it simply never receives these types.
     exact (default; flags = RSP_FLAG_PER_EXPERT):
         <P3XC header, expert=0xFFFF, array=float32 [n_reduced, <activation>]>
         n_reduced   : uint16             rows, one weighted contribution each
-        flags       : uint16             RSP_FLAG_PER_EXPERT
+        flags       : uint16             RSP_FLAG_PER_EXPERT [| RSP_FLAG_REQUEST_ID]
         experts     : n_reduced * uint16 which expert each row belongs to
+        request_id  : uint64             only if flags & RSP_FLAG_REQUEST_ID
 
-    fast (only if the request set REQ_FLAG_FAST; flags = 0):
+    fast (only if the request set REQ_FLAG_FAST):
         <P3XC header, expert=0xFFFF, array=partial sum>
         n_reduced   : uint16             experts folded into the sum
-        flags       : uint16             0
+        flags       : uint16             0 [| RSP_FLAG_REQUEST_ID]
+        request_id  : uint64             only if flags & RSP_FLAG_REQUEST_ID
 
 The **exact** shape is the default because collapsing a subcluster's experts into
 one fp32 partial re-associates the additions: a token's top-k positions
@@ -100,12 +110,23 @@ MAX_STRING_BYTES = 512
 #: ``BREQ`` flag: answer with one partial sum instead of per-expert rows. Opt-in
 #: only - it re-associates the layer's fp32 reduction (see above).
 REQ_FLAG_FAST = 0x0001
-REQ_FLAG_MASK = REQ_FLAG_FAST
+
+#: ``BREQ`` flag: the trailer carries a 64-bit request id naming this *logical*
+#: batch. A caller reuses it when it retries the same batch (to a replica
+#: endpoint of the same coordinator, say), which is what lets the coordinator
+#: recognise the retry and answer from its dedup cache instead of running the
+#: experts twice. Optional so a phase-2 frame still parses.
+REQ_FLAG_REQUEST_ID = 0x0002
+REQ_FLAG_MASK = REQ_FLAG_FAST | REQ_FLAG_REQUEST_ID
 
 #: ``BRSP`` flag: the array holds one weighted contribution per expert, tagged
 #: with its expert id, rather than a single partial sum. Set on exact replies.
 RSP_FLAG_PER_EXPERT = 0x0001
-RSP_FLAG_MASK = RSP_FLAG_PER_EXPERT
+
+#: ``BRSP`` flag: the trailer echoes the request's 64-bit id, so a caller can
+#: tell which attempt a reply belongs to and drop a stale one.
+RSP_FLAG_REQUEST_ID = 0x0002
+RSP_FLAG_MASK = RSP_FLAG_PER_EXPERT | RSP_FLAG_REQUEST_ID
 
 #: ``expert`` field for frames that address a subcluster rather than an expert.
 NO_EXPERT = 0xFFFF
@@ -126,6 +147,10 @@ _ENTRY = struct.Struct("!HBBf")
 _COUNT = struct.Struct("!HH")
 _REQ_HEAD = struct.Struct("!HHI")
 _FAILURE_HEAD = struct.Struct("!HHH")
+_REQUEST_ID = struct.Struct("!Q")
+
+#: Bound on a request id; ids are opaque, but they must fit the wire field.
+MAX_REQUEST_ID = 0xFFFFFFFFFFFFFFFF
 
 #: Bound on ``deadline_ms`` (one hour); a nonsense deadline is rejected rather
 #: than silently clamped.
@@ -151,11 +176,13 @@ class BatchFailure(NamedTuple):
 # -- requests ---------------------------------------------------------------
 def encode_batch_request(layer: int, token_id: int, x: np.ndarray,
                          entries: Sequence[BatchEntry],
-                         deadline_ms: int = 0, fast: bool = False) -> bytes:
+                         deadline_ms: int = 0, fast: bool = False,
+                         request_id: Optional[int] = None) -> bytes:
     """Encode a BREQ: the activation once, plus the ``(expert, gate)`` list.
 
     ``fast`` asks for a single partial sum instead of per-expert contributions,
-    giving up bit-identity with the flat reduction.
+    giving up bit-identity with the flat reduction. ``request_id`` names the
+    logical batch so a retry of it can be recognised downstream.
     """
     if not entries:
         raise ProtocolError("batch request needs at least one entry")
@@ -164,8 +191,14 @@ def encode_batch_request(layer: int, token_id: int, x: np.ndarray,
                             f"{MAX_BATCH_ENTRIES}")
     if not 0 <= deadline_ms <= MAX_DEADLINE_MS:
         raise ProtocolError(f"deadline_ms {deadline_ms} out of range")
-    trailer = [_REQ_HEAD.pack(len(entries), REQ_FLAG_FAST if fast else 0,
-                              deadline_ms)]
+    flags = REQ_FLAG_FAST if fast else 0
+    if request_id is not None:
+        if not 0 <= request_id <= MAX_REQUEST_ID:
+            raise ProtocolError(f"request_id {request_id} out of range")
+        flags |= REQ_FLAG_REQUEST_ID
+    trailer = [_REQ_HEAD.pack(len(entries), flags, deadline_ms)]
+    if request_id is not None:
+        trailer.append(_REQUEST_ID.pack(request_id))
     for entry in entries:
         if not 0 <= entry.expert <= 0xFFFF:
             raise ProtocolError(f"expert {entry.expert} out of range")
@@ -194,13 +227,18 @@ def parse_batch_request(msg: dict) -> dict:
         raise ProtocolError("batch request has no entries")
     if n_entries > MAX_BATCH_ENTRIES:
         raise ProtocolError(f"{n_entries} entries exceeds {MAX_BATCH_ENTRIES}")
-    expected = _REQ_HEAD.size + n_entries * _ENTRY.size
+    has_id = bool(flags & REQ_FLAG_REQUEST_ID)
+    id_size = _REQUEST_ID.size if has_id else 0
+    expected = _REQ_HEAD.size + id_size + n_entries * _ENTRY.size
     if len(trailer) != expected:
         raise ProtocolError(f"batch trailer is {len(trailer)} bytes, "
                             f"expected {expected} for {n_entries} entries")
+    request_id: Optional[int] = None
+    if has_id:
+        (request_id,) = _REQUEST_ID.unpack_from(trailer, _REQ_HEAD.size)
     entries: List[BatchEntry] = []
     seen = set()
-    off = _REQ_HEAD.size
+    off = _REQ_HEAD.size + id_size
     for _ in range(n_entries):
         expert, replica, reserved, gate = _ENTRY.unpack_from(trailer, off)
         off += _ENTRY.size
@@ -213,23 +251,27 @@ def parse_batch_request(msg: dict) -> dict:
     msg["entries"] = entries
     msg["deadline_ms"] = deadline_ms
     msg["fast"] = bool(flags & REQ_FLAG_FAST)
+    msg["request_id"] = request_id
     return msg
 
 
 # -- responses --------------------------------------------------------------
 def encode_batch_response(layer: int, token_id: int, partial: np.ndarray,
-                          n_reduced: int) -> bytes:
+                          n_reduced: int,
+                          request_id: Optional[int] = None) -> bytes:
     """Encode a *fast* BRSP carrying one subcluster's partial sum."""
     if n_reduced < 1 or n_reduced > MAX_BATCH_ENTRIES:
         raise ProtocolError(f"n_reduced {n_reduced} out of range")
+    flags, echo = _echo(request_id)
     return encode(MSG_BRSP, layer, NO_EXPERT, token_id,
                   np.ascontiguousarray(partial, dtype=np.float32),
-                  _COUNT.pack(n_reduced, 0))
+                  _COUNT.pack(n_reduced, flags) + echo)
 
 
 def encode_batch_contributions(layer: int, token_id: int,
                                contributions: Sequence[np.ndarray],
-                               experts: Sequence[int]) -> bytes:
+                               experts: Sequence[int],
+                               request_id: Optional[int] = None) -> bytes:
     """Encode an *exact* BRSP: one weighted contribution per expert.
 
     ``contributions[i]`` is ``gate_i * expert_i(x)`` exactly as the flat
@@ -245,12 +287,23 @@ def encode_batch_contributions(layer: int, token_id: int,
                             f"{MAX_BATCH_ENTRIES}")
     rows = np.stack([np.ascontiguousarray(c, dtype=np.float32)
                      for c in contributions])
-    tags = [_COUNT.pack(len(contributions), RSP_FLAG_PER_EXPERT)]
+    flags, echo = _echo(request_id)
+    tags = [_COUNT.pack(len(contributions), RSP_FLAG_PER_EXPERT | flags)]
     for expert in experts:
         if not 0 <= expert <= 0xFFFF:
             raise ProtocolError(f"expert {expert} out of range")
         tags.append(struct.pack("!H", expert))
+    tags.append(echo)
     return encode(MSG_BRSP, layer, NO_EXPERT, token_id, rows, b"".join(tags))
+
+
+def _echo(request_id: Optional[int]) -> Tuple[int, bytes]:
+    """Response flag and trailer bytes echoing ``request_id``, if any."""
+    if request_id is None:
+        return 0, b""
+    if not 0 <= request_id <= MAX_REQUEST_ID:
+        raise ProtocolError(f"request_id {request_id} out of range")
+    return RSP_FLAG_REQUEST_ID, _REQUEST_ID.pack(request_id)
 
 
 def decode_batch_response(body: bytes) -> dict:
@@ -272,13 +325,14 @@ def parse_batch_response(msg: dict) -> dict:
         raise ProtocolError(f"n_reduced {n_reduced} exceeds "
                             f"{MAX_BATCH_ENTRIES}")
     per_expert = bool(flags & RSP_FLAG_PER_EXPERT)
+    id_size = _REQUEST_ID.size if flags & RSP_FLAG_REQUEST_ID else 0
     experts: List[int] = []
+    expected = _COUNT.size + (2 * n_reduced if per_expert else 0) + id_size
+    if len(trailer) != expected:
+        raise ProtocolError(f"batch response trailer is {len(trailer)} bytes, "
+                            f"expected {expected} for {n_reduced} "
+                            f"contributions")
     if per_expert:
-        expected = _COUNT.size + 2 * n_reduced
-        if len(trailer) != expected:
-            raise ProtocolError(f"batch response trailer is {len(trailer)} "
-                                f"bytes, expected {expected} for {n_reduced} "
-                                f"contributions")
         experts = list(struct.unpack_from("!%dH" % n_reduced, trailer,
                                           _COUNT.size))
         if len(set(experts)) != len(experts):
@@ -287,20 +341,28 @@ def parse_batch_response(msg: dict) -> dict:
         if rows.ndim < 2 or rows.shape[0] != n_reduced:
             raise ProtocolError(f"batch response array {rows.shape} does not "
                                 f"hold {n_reduced} contributions")
-    elif len(trailer) != _COUNT.size:
-        raise ProtocolError(f"batch response trailer is {len(trailer)} bytes, "
-                            f"expected {_COUNT.size}")
+    request_id: Optional[int] = None
+    if id_size:
+        (request_id,) = _REQUEST_ID.unpack_from(trailer, len(trailer) - id_size)
     msg["n_reduced"] = n_reduced
     msg["per_expert"] = per_expert
     msg["experts"] = experts
+    msg["request_id"] = request_id
     return msg
 
 
 # -- errors -----------------------------------------------------------------
 def encode_batch_error(layer: int, token_id: int, code: int,
                        failures: Sequence[BatchFailure] = (),
-                       detail: str = "") -> bytes:
-    """Encode a BERR naming every expert that could not contribute."""
+                       detail: str = "",
+                       request_id: Optional[int] = None) -> bytes:
+    """Encode a BERR naming every expert that could not contribute.
+
+    ``request_id``, when given, is appended as the same big-endian uint64 a BRSP
+    echoes, so a caller can tell a failure of *its* batch from a late failure of
+    an abandoned attempt. A frame from a peer that does not echo ids simply ends
+    after its detail string.
+    """
     if len(failures) > MAX_BATCH_ENTRIES:
         raise ProtocolError(f"{len(failures)} failures exceeds "
                             f"{MAX_BATCH_ENTRIES}")
@@ -313,6 +375,10 @@ def encode_batch_error(layer: int, token_id: int, code: int,
     body = _clip(detail)
     parts.append(struct.pack("!H", len(body)))
     parts.append(body)
+    if request_id is not None:
+        if not 0 <= request_id <= MAX_REQUEST_ID:
+            raise ProtocolError(f"request_id {request_id} out of range")
+        parts.append(_REQUEST_ID.pack(request_id))
     return encode(MSG_BERR, layer, NO_EXPERT, token_id,
                   np.zeros(1, np.float32), b"".join(parts))
 
@@ -353,11 +419,21 @@ def parse_batch_error(msg: dict) -> dict:
     if detail_len > MAX_STRING_BYTES:
         raise ProtocolError(f"detail of {detail_len} bytes exceeds "
                             f"{MAX_STRING_BYTES}")
-    if len(trailer) != off + detail_len:
+    if len(trailer) < off + detail_len:
         raise ProtocolError("batch error length mismatch")
+    detail = trailer[off:off + detail_len].decode("utf-8", "replace")
+    off += detail_len
+    rest = len(trailer) - off
+    request_id: Optional[int] = None
+    if rest == _REQUEST_ID.size:
+        (request_id,) = _REQUEST_ID.unpack_from(trailer, off)
+    elif rest:
+        raise ProtocolError(f"batch error has {rest} trailing bytes, "
+                            f"expected 0 or {_REQUEST_ID.size}")
     msg["code"] = code
     msg["failures"] = failures
-    msg["detail"] = trailer[off:off + detail_len].decode("utf-8", "replace")
+    msg["detail"] = detail
+    msg["request_id"] = request_id
     return msg
 
 

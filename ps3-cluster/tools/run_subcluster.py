@@ -4,6 +4,10 @@
     # on the head server that fronts sc-0000's 22 consoles
     python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
 
+    # the same head server's second (standby) address, for failover
+    python3 tools/run_subcluster.py --config cluster.json \
+        --subcluster sc-0000 --standby 0
+
     # what does this config contain?
     python3 tools/run_subcluster.py --config cluster.json --list
 
@@ -28,6 +32,8 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ps3_cluster.coordinator import SubclusterCoordinator, SubclusterService
+from ps3_cluster.dedup import (DEFAULT_DEDUP_ENTRIES, DEFAULT_DEDUP_TTL,
+                               DedupCache)
 from ps3_cluster.deployment import ClusterConfig
 from ps3_cluster.dispatch import RetryPolicy
 
@@ -39,6 +45,14 @@ def main() -> int:
     ap.add_argument("--subcluster", help="subcluster id to serve")
     ap.add_argument("--host", help="override the configured listen host")
     ap.add_argument("--port", type=int, help="override the configured port")
+    ap.add_argument("--standby", type=int,
+                    help="listen on configured standby address N instead of "
+                         "the subcluster's primary")
+    ap.add_argument("--dedup-entries", type=int,
+                    default=DEFAULT_DEDUP_ENTRIES,
+                    help="batches remembered for retry replay (bounded)")
+    ap.add_argument("--dedup-ttl", type=float, default=DEFAULT_DEDUP_TTL,
+                    help="seconds a remembered batch stays replayable")
     ap.add_argument("--timeout", type=float, default=30.0,
                     help="ceiling on one downstream expert call, seconds")
     ap.add_argument("--attempts", type=int, default=2,
@@ -68,7 +82,8 @@ def main() -> int:
         spec.group_id, config.placement(spec.group_id),
         config.expert_endpoints(spec.group_id), timeout=args.timeout,
         retry_policy=RetryPolicy(attempts=args.attempts),
-        allow_fast=not args.refuse_fast)
+        allow_fast=not args.refuse_fast,
+        dedup=DedupCache(max_entries=args.dedup_entries, ttl=args.dedup_ttl))
 
     if args.check_members:
         try:
@@ -78,8 +93,14 @@ def main() -> int:
             coordinator.close()
         return 0
 
-    host_arg = args.host or spec.endpoint[0]
-    port_arg = spec.endpoint[1] if args.port is None else args.port
+    listen = spec.endpoint
+    if args.standby is not None:
+        if not 0 <= args.standby < len(spec.standby):
+            ap.error(f"{spec.group_id} has {len(spec.standby)} standby "
+                     f"addresses")
+        listen = spec.standby[args.standby]
+    host_arg = args.host or listen[0]
+    port_arg = listen[1] if args.port is None else args.port
     service = SubclusterService(coordinator, host=host_arg,
                                 port=port_arg).start()
     host, port = service.address

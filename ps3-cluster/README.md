@@ -24,9 +24,11 @@ python3 tools/plan_k3.py                     # size the cluster for Kimi K3
   `transport.py` holds persistent pooled P3XC connections with several requests
   in flight per node; `subcluster.py` groups nodes into Condor-style
   subclusters of 22 for hierarchical fan-out; `coordinator.py` runs a real head
-  server per subcluster and `hierarchy.py` is the layer-side half that sends one
-  batched request per subcluster (`batch.py` is that wire format,
-  `deployment.py` the JSON membership config); `errors.py` is the
+  server per subcluster, `regional.py` runs the same coordinator one tier up
+  over a set of head servers, and `hierarchy.py` is the client half that sends
+  one batched request per immediate downstream group (`batch.py` is that wire
+  format, `deployment.py` the JSON membership config, `dedup.py` the bounded
+  retry-replay cache); `errors.py` is the
   node-attributed failure hierarchy; `topology.py` plans the 1-expert/node
   layout; `protocol.py` is the big-endian wire codec; `node.py` is a reference
   (numpy) expert worker.
@@ -167,6 +169,87 @@ Properties, all covered by `tests/test_hierarchy.py` over real sockets:
 - The flat `DistributedExpertDispatcher` and the canonical
   one-expert-per-layer-per-node placement are unchanged; a head server is an
   overlay, not a placement authority.
+
+## Three tiers, and failover between coordinators
+
+Condor's heads reported to servers above them; a single layer coordinator
+speaking to 78 heads is the same bottleneck one tier up. `regional.py` adds the
+middle tier, and it is the *same* coordinator: `RegionalCoordinator` subclasses
+the `BaseCoordinator` that head servers use, speaks the same BREQ/BRSP/BERR, and
+its downstream links are `SubclusterTransport` links — so a region is a client of
+heads exactly as the layer is a client of regions, and a fourth tier would be
+another instance of the same pair.
+
+```
+layer coordinator ─BREQ─▶ region rg-0000 (primary, standby…) ─BREQ─▶ head sc-0000 ─▶ 22 consoles
+                  ─BREQ─▶ region rg-0001 …                   ─BREQ─▶ head sc-0001 …
+                  ◀─BRSP: gate_j·y_j rows, tagged with the *global* top-k position
+```
+
+```bash
+python3 tools/gen_cluster_config.py --layer 3 --experts 88 \
+    --expert-host 10.0.0.10 --head-host 10.0.1.1 \
+    --regions 2 --region-host 10.0.2.1 -o cluster.json
+
+python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
+python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
+    --standby 0                          # second address of the same head
+python3 tools/run_region.py --config cluster.json --region rg-0000
+python3 tools/run_region.py --config cluster.json --region rg-0000 --standby 0
+python3 tools/run_region.py --config cluster.json --list
+python3 tools/run_region.py --config cluster.json --region rg-0000 \
+    --check-members                      # PING every head under this region
+python3 tools/run_region.py --config cluster.json --region rg-0000 \
+    --attempts 3 --retry-ambiguous       # see "retry semantics" below
+```
+
+The layer coordinator points at the regions instead of the heads; nothing else
+about its code changes:
+
+```python
+config = ClusterConfig.load("cluster.json")
+transport = SubclusterTransport(config.region_endpoints(), timeout=30.0)
+dispatcher = HierarchicalExpertDispatcher(config.placement(),
+                                          config.tiered_plan(), transport)
+y = dispatcher.run_expert_stage(layer, x, expert_ids, gate_weights, token_id)
+```
+
+`config.tiered_plan()` is a `TieredPlan`: consoles → heads → regions, so the
+layer groups a token's top-k by *region* while each region regroups its slice by
+head. Exactness is unaffected at any depth, because no tier reduces in exact
+mode — the rows travel up tagged with the expert they belong to and only the
+layer adds them, in its own top-k order. A config with no `regions` block still
+drives the two-tier path, and `DistributedExpertDispatcher` still drives the
+one-tier path.
+
+**Coordinator replicas.** Every coordinator address in the config is an ordered
+list: `{"id": "rg-0000", "host": …, "port": …, "standby": [{"host": …, "port":
+…}]}`, at layer→region and region→head alike (expert replicas are unchanged).
+The transport prefers the first endpoint it believes is alive and walks the list
+on failure; PING/PONG *steers* that preference but never removes an endpoint, so
+a cold or wrongly-marked-dead address is still tried when it is the only one
+left. Head servers are stateless, so a standby is just another listener on the
+same config.
+
+**Retry semantics, by what the caller can prove.** Each batch carries a 64-bit
+request id (`REQ_FLAG_REQUEST_ID`) that a coordinator echoes in its BRSP *and*
+its BERR, and that a retry reuses:
+
+| situation | what is known | default |
+| --- | --- | --- |
+| no endpoint accepted the connection or the frame | downstream cannot have run | retried (`retry_safe`, at-most-once) |
+| timeout, or the link died after the frame went out | downstream **may** be running | not retried; `LinkRetryPolicy(retry_ambiguous=True)` opts in |
+| answer arrives naming another request id | not this batch | refused, never reduced |
+
+An ambiguous retry is at-least-once *execution* and stays exactly-once
+*reduction*: the abandoned attempt's correlation key is retired, so its late
+answer is dropped rather than added, and the caller reduces exactly one complete
+response. A retry that reaches the *same* coordinator process replays the first
+attempt's frame from a bounded `DedupCache` (`--dedup-entries`, `--dedup-ttl`;
+128 entries / 60 s by default, LRU-evicted and TTL-expired, so no unbounded
+per-token state) and does not re-run the experts. A retry that reaches a
+*different* process cannot be recognised — there is no shared store — and the
+work does run twice.
 
 **Heartbeats.** `transport.ping(node)` / `.alive(node)` use the protocol's
 PING/PONG frames on the same connection as expert traffic; both the Python and C

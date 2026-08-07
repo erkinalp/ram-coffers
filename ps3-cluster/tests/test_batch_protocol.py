@@ -88,8 +88,9 @@ class TestBatchRequest(unittest.TestCase):
         body = B.encode_batch_request(0, 0, np.ones(2, np.float32),
                                       entries(1))[4:]
         head = len(body) - 8 - 8
-        # 0x0001 is REQ_FLAG_FAST; 0x0002 is not assigned.
-        forged = (body[:head] + struct.pack("!HHI", 1, 0x0002, 0)
+        # 0x0001 is REQ_FLAG_FAST, 0x0002 REQ_FLAG_REQUEST_ID; 0x0004 is not
+        # assigned.
+        forged = (body[:head] + struct.pack("!HHI", 1, 0x0004, 0)
                   + body[head + 8:])
         with self.assertRaises(P.ProtocolError) as ctx:
             B.decode_batch_request(forged)
@@ -257,6 +258,76 @@ class TestBatchError(unittest.TestCase):
             [B.BatchFailure(1, B.ERR_UNKNOWN, "ps3-x")])[4:]
         with self.assertRaises(P.ProtocolError):
             B.decode_batch_error(body[:-4])
+
+
+class TestRequestIdentity(unittest.TestCase):
+    """The optional uint64 that names one logical batch across its retries."""
+
+    def test_absent_by_default_in_every_frame_kind(self):
+        x = np.ones(4, np.float32)
+        request = B.decode_batch_request(
+            B.encode_batch_request(1, 2, x, entries(2))[4:])
+        self.assertIsNone(request["request_id"])
+        response = B.decode_batch_response(
+            B.encode_batch_response(1, 2, x, 2)[4:])
+        self.assertIsNone(response["request_id"])
+        rows = B.decode_batch_response(
+            B.encode_batch_contributions(1, 2, [x, x], [0, 1])[4:])
+        self.assertIsNone(rows["request_id"])
+        error = B.decode_batch_error(
+            B.encode_batch_error(1, 2, B.ERR_NODE_TIMEOUT)[4:])
+        self.assertIsNone(error["request_id"])
+
+    def test_roundtrips_through_request_response_and_error(self):
+        rid = 0x0123456789ABCDEF
+        x = np.arange(4, dtype=np.float32)
+        request = B.decode_batch_request(
+            B.encode_batch_request(1, 2, x, entries(2), request_id=rid)[4:])
+        self.assertEqual(request["request_id"], rid)
+        self.assertEqual([e.expert for e in request["entries"]], [0, 1])
+        partial = B.decode_batch_response(
+            B.encode_batch_response(1, 2, x, 2, request_id=rid)[4:])
+        self.assertEqual(partial["request_id"], rid)
+        np.testing.assert_array_equal(partial["array"], x)
+        rows = B.decode_batch_response(
+            B.encode_batch_contributions(1, 2, [x, x], [4, 9],
+                                         request_id=rid)[4:])
+        self.assertEqual(rows["request_id"], rid)
+        self.assertEqual(rows["experts"], [4, 9])
+        failure = B.BatchFailure(expert=4, reason=B.ERR_NODE_UNREACHABLE,
+                                 node_id="ps3-L001-E0004")
+        error = B.decode_batch_error(
+            B.encode_batch_error(1, 2, B.ERR_NODE_UNREACHABLE, [failure],
+                                 "console down", request_id=rid)[4:])
+        self.assertEqual(error["request_id"], rid)
+        self.assertEqual(error["failures"], [failure])
+        self.assertEqual(error["detail"], "console down")
+
+    def test_max_id_survives_and_out_of_range_is_refused(self):
+        x = np.ones(2, np.float32)
+        msg = B.decode_batch_request(
+            B.encode_batch_request(1, 2, x, entries(1),
+                                   request_id=B.MAX_REQUEST_ID)[4:])
+        self.assertEqual(msg["request_id"], B.MAX_REQUEST_ID)
+        for bad in (-1, B.MAX_REQUEST_ID + 1):
+            with self.assertRaises(P.ProtocolError):
+                B.encode_batch_request(1, 2, x, entries(1), request_id=bad)
+            with self.assertRaises(P.ProtocolError):
+                B.encode_batch_error(1, 2, B.ERR_UNKNOWN, request_id=bad)
+
+    def test_a_truncated_id_trailer_is_refused(self):
+        x = np.ones(2, np.float32)
+        body = B.encode_batch_request(1, 2, x, entries(1), request_id=7)[4:]
+        with self.assertRaises(P.ProtocolError):
+            B.decode_batch_request(body[:-2])
+        rows = B.encode_batch_contributions(1, 2, [x], [0], request_id=7)[4:]
+        with self.assertRaises(P.ProtocolError):
+            B.decode_batch_response(rows[:-2])
+        err = B.encode_batch_error(1, 2, B.ERR_UNKNOWN, (), "d",
+                                   request_id=7)[4:]
+        with self.assertRaises(P.ProtocolError) as ctx:
+            B.decode_batch_error(err[:-2])
+        self.assertIn("trailing", str(ctx.exception))
 
 
 class TestExpertFrameCompatibility(unittest.TestCase):
