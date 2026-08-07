@@ -4,7 +4,7 @@
     # on the head server that fronts sc-0000's 22 consoles
     python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
 
-    # the same head server's second (standby) address, for failover
+    # an independent standby process for the same subcluster, for failover
     python3 tools/run_subcluster.py --config cluster.json \
         --subcluster sc-0000 --standby 0
 
