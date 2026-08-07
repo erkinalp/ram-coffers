@@ -77,13 +77,24 @@ ps3-cluster/
     topology.py            1-expert-1-layer/node planner + Kimi K3 profile
     dispatch.py            the #316 port: ExpertPlacement + Transport + dispatcher
     transport.py           persistent pooled P3XC transport (multiple in flight)
+    node.py                reference expert worker (numpy)
     subcluster.py          Condor-style subclusters of 22 + hierarchical reduce
+    batch.py               BREQ/BRSP/BERR batch wire format
     errors.py              node-attributed transport failure hierarchy
-    node.py                reference expert worker (numpy) + TCP server
+    dedup.py               bounded request-id/fingerprint replay cache
+    deployment.py          JSON membership config + ClusterConfig
+    coordinator.py         deployable head-server process per subcluster
+    regional.py            deployable regional/head-of-heads coordinator
+    hierarchy.py           layer-side batched transport + dispatcher
   tools/
     pack_expert.py         pack a SwiGLU expert to MXFP4 .exp + numpy reference
     plan_k3.py             print the cluster plan
-  tests/                   protocol / topology / dispatch / cross-language kernel
+    gen_cluster_config.py  generate shared cluster.json
+    run_expert.py          reference numpy expert server
+    run_subcluster.py      run one head server
+    run_region.py          run one regional coordinator
+    run_layer.py           run one token through the hierarchy
+  tests/                   protocol / topology / dispatch / cross-language / hierarchy
   Makefile                 `make host` (portable) | `make ps3` (ppu-gcc + spu-gcc)
 ```
 
@@ -123,7 +134,7 @@ asynchronously.
 ```
 coordinator                                     console (expert node)
   connect()  ------------------------------->   accept(), fork per connection
-  REQ  (layer, expert, token=7)  ----------->   compute SwiGLU on SPE/RSX/PPE
+  REQ  (layer, expert, token=7)  ----------->   compute SwiGLU on the selected backend (SPE, RSX, or scalar PPE)
   REQ  (layer, expert, token=8)  ----------->     (queued behind token=7)
   PING (token=8)                 ----------->   PONG
   <----------------------------------- RSP (token=7)
@@ -151,9 +162,10 @@ Wire-level rules:
   fails every outstanding waiter, and makes further use raise `TransportClosed`.
   It is idempotent, and the transport is a context manager.
 
-The protocol did not change: framing is the same fixed big-endian P3XC, and the
-old `SocketTransport` (connection per dispatch) still works and is still used by
-the existing tests.
+The old expert P3XC `REQ`/`RSP` format did not change: framing is still the same
+fixed big-endian P3XC, and the old `SocketTransport` (connection per dispatch)
+still works and is still used by the existing tests. The protocol gained the
+batch extensions `BREQ`/`BRSP`/`BERR` for coordinator-to-coordinator traffic.
 
 ### Concurrent top-k with deterministic reduction
 
@@ -173,8 +185,12 @@ never in completion order, so results are bit-identical to the old serial loop
 frames, `alive(node)` reduces that to a bool, and
 `dispatcher.check_liveness(nodes)` probes many nodes concurrently. Heartbeats
 share the connection with expert traffic, and both workers answer them
-(`node.py`, `ppu/expert_ppu.c`). This is the coordinator-side supervision the
-Gravity Grid and pLBM PS3 clusters ran from their head nodes, minus MPI.
+(`node.py`, `ppu/expert_ppu.c`). This mirrors the supervision model of the
+[PS3 Gravity Grid](https://web.uri.edu/gravity/ps3/) and Nomura et al.'s
+pLBM cluster: a head node coordinates its assigned consoles, each console's PPE
+manages its own SPEs, and data moves between consoles across the network (those
+prior clusters used MPI between consoles; this port uses the P3XC protocol and
+keeps the same per-console PPE+SPE structure).
 
 ### Subclusters
 
@@ -321,8 +337,8 @@ included. The three process tiers are started like this:
 | Tier | Command |
 |---|---|
 | console | `build/expert_node_host expert.exp <port>` (real hardware), or `python3 tools/run_expert.py expert.exp --port <port>` — the numpy reference worker, `--identity` for a trivial expert |
-| head server | `python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000`; `--host`/`--port` override the config, `--standby N` serves the head's Nth extra address, `--timeout` sets the downstream budget in seconds, `--attempts` the retries per expert and `--retry-ambiguous` widens which failures are retried, `--dedup-entries`/`--dedup-ttl` bound the replay cache, `--refuse-fast` rejects approximate batches with `ERR_BAD_REQUEST`, `--list` and `--check-members` inspect without serving |
-| layer | any process holding a `SubclusterTransport` + `HierarchicalExpertDispatcher` over the same `cluster.json` (see `ps3-cluster/README.md`) |
+| head server | `python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000`; `--host`/`--port` override the config, `--standby N` serves the head's Nth extra address, `--timeout` sets the downstream budget in seconds, `--attempts` the tries per expert, `--retry-on-timeout` / `--retry-on-disconnect` / `--retry-on-node-error` opt into wider expert-link retry (default = safe failures only), `--dedup-entries` / `--dedup-ttl` / `--dedup-bytes` bound the replay cache, `--refuse-fast` rejects approximate batches with `ERR_BAD_REQUEST`, `--list` and `--check-members` inspect without serving |
+| layer | `python3 tools/run_layer.py --config cluster.json --layer L --token T --experts e0 e1 --gates g0 g1 --activation x.npy --output y.npy` or any process holding a `SubclusterTransport` + `HierarchicalExpertDispatcher` over the same `cluster.json` (see `ps3-cluster/README.md`) |
 
 `tools/gen_cluster_config.py` writes the config for one layer (`--experts`,
 `--size`, `--expert-host`/`--expert-port-base`, `--head-host`/`--head-port-base`,
@@ -377,11 +393,14 @@ every depth.
 config is an ordered list (`"standby": [{"host": …, "port": …}]`) at layer→region
 and region→head alike, in addition to the existing expert replicas. The
 transport sends to the first endpoint it believes is alive and walks the list on
-failure. `PING`/`PONG` only *steers* that preference: an endpoint marked dead is
-sorted last, never removed, so a wrongly-marked or never-probed address is still
-tried when it is the only one left — correctness never depends on health state.
-Head servers and regions are stateless, so a standby is just another listener on
-the same `cluster.json` (`--standby N`).
+failure. `PING`/`PONG` only *steers* that preference, and the preference changes only
+after an explicit ping/check_liveness or an observed request failure; it is not
+a background monitor. An endpoint marked dead is sorted last, never removed, so
+a wrongly-marked or never-probed address is still tried when it is the only one
+left — correctness never depends on health state.
+Head servers and regions keep no durable/shared state, so a standby is just
+another listener on the same `cluster.json` (`--standby N`); per-process bounded
+dedup/health caches are ephemeral and do not span primaries and standbys.
 
 **Request identity.** Each batch carries a 64-bit id (`next_request_id()`:
 process-random high bits + a counter, so two layer coordinators cannot mint the
@@ -408,9 +427,14 @@ per request id in a `DedupCache`: a retry that lands on the *same* process (a
 reconnect, or the caller reaching it through another of its own addresses)
 replays that frame instead of fanning out again, and a duplicate arriving while
 the first attempt is still running waits for it rather than starting a second.
-The cache is bounded and expiring — `--dedup-entries` (128) and `--dedup-ttl`
-(60 s), LRU eviction, failed attempts not remembered — so no unbounded per-token
-state accumulates; an evicted or expired id honestly re-executes. A retry that
+The cache is bounded and expiring — `--dedup-entries` (128 entries), `--dedup-ttl`
+(60 s) and `--dedup-bytes` (128 MiB by default). It evicts completed responses
+by LRU to stay under both count and byte limits, tracks response bytes precisely,
+never evicts an in-flight slot (instead back-pressuring with `ERR_DEDUP_CAPACITY`),
+and does not retain a single response larger than the byte budget (the response
+is answered but not cached). Failed attempts are not remembered — so no
+unbounded per-token state accumulates; an evicted or expired id honestly
+re-executes. A retry that
 lands on a *different* replica process cannot be recognised: there is no shared
 store, and introducing one would mean a consensus dependency this design
 refuses. That case is at-least-once execution with exactly-once reduction, and
@@ -420,8 +444,8 @@ it is documented rather than papered over.
 
 | Tier | Command |
 |---|---|
-| region | `python3 tools/run_region.py --config cluster.json --region rg-0000`; `--standby N` serves the region's Nth extra address, `--attempts`/`--retry-ambiguous` set the link policy, `--dedup-entries`/`--dedup-ttl` bound the replay cache, `--refuse-fast` rejects approximate batches, `--list`/`--check-members` inspect without serving |
-| layer | `SubclusterTransport(config.region_endpoints())` + `HierarchicalExpertDispatcher(config.placement(), config.tiered_plan(), transport)` |
+| region | `python3 tools/run_region.py --config cluster.json --region rg-0000`; `--standby N` serves the region's Nth extra address, `--attempts`/`--retry-ambiguous` set the layer->region link policy, `--dedup-entries` / `--dedup-ttl` / `--dedup-bytes` bound the replay cache, `--refuse-fast` rejects approximate batches, `--list`/`--check-members` inspect without serving |
+| layer | `python3 tools/run_layer.py --config cluster.json ...` or `SubclusterTransport(config.region_endpoints())` + `HierarchicalExpertDispatcher(config.placement(), config.tiered_plan(), transport)` |
 
 `tools/gen_cluster_config.py --regions N --region-host … --region-port-base …`
 writes the three-tier config, dealing heads out contiguously so a token's top-k
@@ -594,7 +618,8 @@ the CPU shader model).
 
 The coordination layer is validated on loopback sockets only. Nothing here has
 run on a physical PlayStation 3, and the latency/bandwidth characteristics of a
-real console farm (100 Mbit NICs, OtherOS hypervisor overhead) are not modelled.
+real console farm (Gigabit Ethernet NICs in theory; real-farm throughput and
+OtherOS hypervisor overhead are unmeasured).
 
 Further limitations of the deployed hierarchy specifically: the tree is three
 levels (layer → region → head → console) and the coordinator abstraction is
@@ -624,11 +649,12 @@ did, rather than inventing a scheme:
   HPEC 2012 — AFRL's 1,716-console cluster, organised as subclusters of 22 PS3s
   behind coordinating servers. Source of the default subcluster size.
 - University of Rhode Island, *[PS3 Gravity Grid](https://web.uri.edu/gravity/ps3/)*
-  — a PS3 cluster running black-hole simulations with a head node supervising the
-  consoles' PPEs while the SPEs do the numerics.
-- K. Nomura et al., *[A Metascalable Computing Framework for Large
-  Spatiotemporal-Scale Atomistic
-  Simulations](https://aiichironakano.github.io/cs653/Nomura-pLBM-IJCS08.pdf)*
+  — a PS3 cluster running black-hole simulations with a head node per subcluster
+  supervising the consoles; each console's PPE manages its own SPEs while MPI
+  carries data across the consoles.
+- K. Nomura et al., *[Parallel Lattice Boltzmann Flow Simulation on A Low-Cost
+  PlayStation3
+  Cluster](https://aiichironakano.github.io/cs653/Nomura-pLBM-IJCS08.pdf)*
   — PS3 lattice-Boltzmann with PPE supervision and SPE offload.
 - IBM, *[ALF Programmer's Guide and API Reference
   v3.0](https://arcb.csc.ncsu.edu/~mueller/cluster/ps3/SDK3.0/docs/lib/ALF_Prog_Guide_API_v3.0.pdf)*

@@ -2,7 +2,7 @@
 
 ## Commit
 
-`eff57a3` on branch `kimi-k3-async-coordination`.
+`TBD` on branch `kimi-k3-async-coordination` (doc/CLI audit cleanup).
 
 ## Scope
 
@@ -12,6 +12,9 @@
 - Fixed-big-endian batch protocol with per-expert and per-region routing (`batch.py`).
 - Request IDs, bounded dedup cache, safe/ambiguous retry, coordinator failover (`dedup.py`, `errors.py`).
 - Three-tier configuration and CLI deployment (`deployment.py`, `tools/`).
+- Docs-vs-reality audit fixes: content-bound dedup, in-flight eviction protection,
+  byte-budget cache, subcluster/per-expert retry flags, layer client CLI,
+  `PS3_CLUSTER_PORT.md` and README corrections.
 
 ## Test command
 
@@ -24,7 +27,7 @@ PYTHONWARNINGS=error::ResourceWarning ./run_tests.sh
 ## Results
 
 ```text
-Ran 213 tests in 248.485s
+Ran 225 tests in 264.899s
 OK
 ```
 

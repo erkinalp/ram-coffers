@@ -68,12 +68,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .batch import (ERR_NODE_DISCONNECTED, ERR_NODE_ERROR, ERR_NODE_TIMEOUT,
-                    ERR_NODE_UNREACHABLE, ERR_SHUTTING_DOWN, ERR_UNKNOWN,
-                    ERR_UNKNOWN_EXPERT, ERR_BAD_REQUEST, BatchFailure,
-                    encode_batch_contributions, encode_batch_error,
-                    encode_batch_response, parse_batch_request)
-from .dedup import DedupCache
+from .batch import (ERR_BAD_REQUEST, ERR_DEDUP_CAPACITY, ERR_NODE_DISCONNECTED,
+                    ERR_NODE_ERROR, ERR_NODE_TIMEOUT, ERR_NODE_UNREACHABLE,
+                    ERR_SHUTTING_DOWN, ERR_UNKNOWN, ERR_UNKNOWN_EXPERT,
+                    BatchFailure, batch_fingerprint, encode_batch_contributions,
+                    encode_batch_error, encode_batch_response,
+                    parse_batch_request)
+from .dedup import DedupCache, DedupCapacityError, MismatchedRequestError
 from .dispatch import (DistributedExpertDispatcher, ExpertPlacement,
                        RetryPolicy)
 from .errors import (NodeConnectError, NodeDisconnected, NodeError,
@@ -176,12 +177,22 @@ class BaseCoordinator:
         timeout = self.timeout
         if msg.get("deadline_ms"):
             timeout = min(timeout, msg["deadline_ms"] / 1000.0)
+        fingerprint = batch_fingerprint(msg)
         try:
-            return self.dedup.run(request_id,
-                                  lambda: self._serve_batch(msg, timeout),
-                                  timeout=timeout)
+            return self.dedup.run(
+                request_id, fingerprint,
+                lambda: self._serve_batch(msg, timeout),
+                timeout=timeout)
         except TimeoutError as exc:
             return encode_batch_error(layer, token_id, ERR_NODE_TIMEOUT,
+                                      detail=str(exc)[:400],
+                                      request_id=request_id)
+        except MismatchedRequestError as exc:
+            return encode_batch_error(layer, token_id, ERR_BAD_REQUEST,
+                                      detail=str(exc)[:400],
+                                      request_id=request_id)
+        except DedupCapacityError as exc:
+            return encode_batch_error(layer, token_id, ERR_DEDUP_CAPACITY,
                                       detail=str(exc)[:400],
                                       request_id=request_id)
 

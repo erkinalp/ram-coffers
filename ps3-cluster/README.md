@@ -35,7 +35,8 @@ python3 tools/plan_k3.py                     # size the cluster for Kimi K3
 - **Cell kernels** (`common/`, `spu/`, `ppu/`): the MVP compute path. `mxfp4.h`
   dequantises microscaling-FP4; `expert_spu.c` is the SPE GEMV kernel with
   DMA-streamed weight tiles; `expert_ppu.c` is the PPE driver that keeps one
-  expert resident, fans each matmul across the SPEs via libspe2, and serves the
+  expert resident, selects the GEMV backend (scalar PPE, Cell SPEs via libspe2,
+  or RSX fragment shader) at compile time, and serves the
   P3XC protocol over TCP.
 - **RSX GPU backend** (`rsx/`): an alternative to the SPE path for the
   GameOS-exploit boot. `expert_rsx.cg` is a Cg fragment shader doing the MXFP4
@@ -60,10 +61,11 @@ is ALF's persistent per-accelerator work queue and DaCS's standing host↔
 accelerator channel, at cluster scale.
 
 **Concurrent top-k.** `DistributedExpertDispatcher.run_expert_stage` submits all
-selected experts together and reduces the results as they arrive; the summation
-itself happens in top-k order, so the output is bit-identical to the old serial
-reduction. `submit_expert_stage` returns a `DispatchStage` for callers that want
-several stages in flight.
+selected experts together and accumulates the results; the summation itself
+happens in top-k order so the output is bit-identical to the old serial
+reduction. (Each contribution is weighted as its data arrives, but the additions
+are always performed in the fixed top-k order.) `submit_expert_stage` returns a
+`DispatchStage` for callers that want several stages in flight.
 
 ```python
 from ps3_cluster import (DistributedExpertDispatcher, ExpertPlacement,
@@ -127,8 +129,11 @@ python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
 | `--standby N` | listen on the head's Nth extra config address instead (see three tiers below) |
 | `--timeout S` | downstream budget in seconds for one batch |
 | `--attempts N` | tries per expert across its primary and replicas |
-| `--retry-ambiguous` | also retry when a console may already have run the work |
-| `--dedup-entries N`, `--dedup-ttl S` | bound of the reconnect replay cache |
+| `--retry-on-timeout` | also retry a timed-out expert call (at-least-once execution) |
+| `--retry-on-disconnect` | also retry a console that dropped mid-flight (at-least-once) |
+| `--retry-on-node-error` | also retry on `ERR`/`NodeError` responses |
+| `--no-replicas` | ignore any configured expert replicas |
+| `--dedup-entries N`, `--dedup-ttl S`, `--dedup-bytes B` | bound of the reconnect replay cache |
 | `--refuse-fast` | reject `fast` (partial-sum) batches with `ERR_BAD_REQUEST` |
 | `--list` | print every head in the config and exit |
 | `--check-members` | PING every console behind this head and exit |
@@ -216,6 +221,14 @@ python3 tools/run_region.py --config cluster.json --region rg-0000 \
     --check-members                      # PING every head under this region
 python3 tools/run_region.py --config cluster.json --region rg-0000 \
     --attempts 3 --retry-ambiguous       # see "retry semantics" below
+
+python3 tools/run_layer.py --config cluster.json --layer 3 --token 0 \
+    --experts 0 1 2 3 --gates 0.4 0.3 0.2 0.1 \
+    --activation activation.npy --output out.npy
+python3 tools/run_layer.py --config cluster.json --layer 3 --token 0 \
+    --experts 0 1 2 3 --gates 0.4 0.3 0.2 0.1 \
+    --activation activation.json --output out.json --fast --retry-attempts 3 \
+    --retry-ambiguous --timeout 30.0
 ```
 
 `--standby N` serves a coordinator's Nth extra address, so it needs those
@@ -226,8 +239,10 @@ right for a laptop bring-up and a starting point for a farm — pass
 a standby does not share a machine with the primary it covers. Without them
 `--standby 0` exits with `rg-0000 has 0 standby addresses, no index 0`.
 
-`run_region.py` takes the same options as `run_subcluster.py`, with `--region ID`
-naming the region and `--check-members` pinging the heads under it rather than
+`run_region.py` takes most of the same options as `run_subcluster.py` except
+that the layer→region link uses `--retry-ambiguous` instead of the per-expert
+`--retry-on-timeout`/`--retry-on-disconnect`/`--retry-on-node-error` flags. `--region
+ID` names the region and `--check-members` pings the heads under it rather than
 consoles.
 
 The layer coordinator points at the regions instead of the heads; nothing else
@@ -255,8 +270,11 @@ list: `{"id": "rg-0000", "host": …, "port": …, "standby": [{"host": …, "po
 The transport prefers the first endpoint it believes is alive and walks the list
 on failure; PING/PONG *steers* that preference but never removes an endpoint, so
 a cold or wrongly-marked-dead address is still tried when it is the only one
-left. Head servers are stateless, so a standby is just another listener on the
-same config.
+left. Head servers and regions keep no durable/shared state, so a standby is
+just another listener on the same config; the bounded dedup/health caches held
+by each process are ephemeral and do not span primary and standby. Health
+preference changes only after an explicit `ping`/`check_liveness` or an observed
+request failure — it is not a background monitor.
 
 **Retry semantics, by what the caller can prove.** Each batch carries a 64-bit
 request id (`REQ_FLAG_REQUEST_ID`) that a coordinator echoes in its BRSP *and*

@@ -32,8 +32,8 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ps3_cluster.coordinator import SubclusterCoordinator, SubclusterService
-from ps3_cluster.dedup import (DEFAULT_DEDUP_ENTRIES, DEFAULT_DEDUP_TTL,
-                               DedupCache)
+from ps3_cluster.dedup import (DEFAULT_DEDUP_BYTES, DEFAULT_DEDUP_ENTRIES,
+                               DEFAULT_DEDUP_TTL, DedupCache)
 from ps3_cluster.deployment import ClusterConfig
 from ps3_cluster.dispatch import RetryPolicy
 
@@ -50,14 +50,26 @@ def main() -> int:
                          "the subcluster's primary")
     ap.add_argument("--dedup-entries", type=int,
                     default=DEFAULT_DEDUP_ENTRIES,
-                    help="batches remembered for retry replay (bounded)")
+                    help="max logical batches tracked (in flight or cached)")
     ap.add_argument("--dedup-ttl", type=float, default=DEFAULT_DEDUP_TTL,
-                    help="seconds a remembered batch stays replayable")
+                    help="seconds a completed answer stays replayable")
+    ap.add_argument("--dedup-bytes", type=int, default=DEFAULT_DEDUP_BYTES,
+                    help="total completed-response byte budget")
     ap.add_argument("--timeout", type=float, default=30.0,
                     help="ceiling on one downstream expert call, seconds")
     ap.add_argument("--attempts", type=int, default=2,
-                    help="tries per expert; retried only when a failure "
-                         "provably never reached a console")
+                    help="tries per expert; a console that never accepted the "
+                         "frame is retried")
+    ap.add_argument("--retry-on-timeout", action="store_true",
+                    help="retry a call whose deadline expired (may execute "
+                         "the expert twice; first response used)")
+    ap.add_argument("--retry-on-disconnect", action="store_true",
+                    help="retry if the connection drops mid-request (may "
+                         "execute the expert twice; first response used)")
+    ap.add_argument("--retry-on-node-error", action="store_true",
+                    help="retry an explicit ERR answer from a console")
+    ap.add_argument("--no-replicas", action="store_true",
+                    help="do not fail over to replica endpoints")
     ap.add_argument("--refuse-fast", action="store_true",
                     help="reject fast (single partial sum) batches, which "
                          "re-associate the layer's fp32 reduction and can "
@@ -81,9 +93,15 @@ def main() -> int:
     coordinator = SubclusterCoordinator(
         spec.group_id, config.placement(spec.group_id),
         config.expert_endpoints(spec.group_id), timeout=args.timeout,
-        retry_policy=RetryPolicy(attempts=args.attempts),
+        retry_policy=RetryPolicy(
+            attempts=args.attempts,
+            retry_on_node_error=args.retry_on_node_error,
+            retry_on_timeout=args.retry_on_timeout,
+            retry_on_disconnect=args.retry_on_disconnect,
+            use_replicas=not args.no_replicas),
         allow_fast=not args.refuse_fast,
-        dedup=DedupCache(max_entries=args.dedup_entries, ttl=args.dedup_ttl))
+        dedup=DedupCache(max_entries=args.dedup_entries, ttl=args.dedup_ttl,
+                         max_bytes=args.dedup_bytes))
 
     if args.check_members:
         try:

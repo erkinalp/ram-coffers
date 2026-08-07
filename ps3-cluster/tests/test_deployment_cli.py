@@ -232,6 +232,85 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
                 json.loads(checked.stdout),
                 {g: True for g in config.region("rg-0000").subclusters})
 
+    def test_run_layer_cli_matches_flat_dispatcher_three_tier(self):
+        path, config = self._config()
+        x = (self.rng.standard_normal(HIDDEN) * 0.5).astype(np.float32)
+        experts = [3, 0, 2]
+        gates = [np.float32(0.5), np.float32(0.25), np.float32(0.125)]
+        x_path = os.path.join(self.tmp.name, "x.npy")
+        out_path = os.path.join(self.tmp.name, "out.npy")
+        np.save(x_path, x)
+        with _Processes() as procs:
+            self._bring_up(procs, path, config)
+            expected = self._flat_reference(config, x, experts, gates)
+            subprocess.run(
+                [sys.executable, os.path.join(TOOLS, "run_layer.py"),
+                 "--config", path, "--layer", str(LAYER), "--token", "7"]
+                + ["--experts"] + [str(e) for e in experts]
+                + ["--gates"] + [str(g) for g in gates]
+                + ["--activation", x_path, "--output", out_path,
+                   "--timeout", "20"],
+                capture_output=True, text=True, check=True)
+            got = np.load(out_path)
+            self.assertTrue(np.array_equal(got, expected))
+
+    def test_run_layer_cli_matches_flat_dispatcher_two_tier(self):
+        path = os.path.join(self.tmp.name, "two-tier.json")
+        subprocess.run(
+            [sys.executable, os.path.join(TOOLS, "gen_cluster_config.py"),
+             "--layer", str(LAYER), "--experts", str(N_EXPERTS),
+             "--size", "1", "--expert-host", "127.0.0.1",
+             "--head-host", "127.0.0.1", "--head-port-base", str(free_port()),
+             "-o", path], capture_output=True, text=True, check=True)
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        for spec, port in zip(doc["subclusters"], self.expert_ports):
+            spec["members"][0]["port"] = port
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        config = ClusterConfig.from_dict(doc)
+        x = np.ones(HIDDEN, dtype=np.float32)
+        experts, gates = [0, 1, 3], [0.5, 0.25, 0.125]
+        x_path = os.path.join(self.tmp.name, "x2.npy")
+        out_path = os.path.join(self.tmp.name, "out2.npy")
+        np.save(x_path, x)
+        with _Processes() as procs:
+            for expert, port in enumerate(self.expert_ports):
+                procs.start([os.path.join(TOOLS, "run_expert.py"),
+                             self.weights[expert][0], "--host", "127.0.0.1",
+                             "--port", str(port)])
+            for spec in config.subclusters:
+                procs.start([os.path.join(TOOLS, "run_subcluster.py"),
+                             "--config", path, "--subcluster", spec.group_id])
+            expected = self._flat_reference(config, x, experts, gates)
+            subprocess.run(
+                [sys.executable, os.path.join(TOOLS, "run_layer.py"),
+                 "--config", path, "--layer", str(LAYER), "--token", "9"]
+                + ["--experts"] + [str(e) for e in experts]
+                + ["--gates"] + [str(g) for g in gates]
+                + ["--activation", x_path, "--output", out_path,
+                   "--timeout", "20"],
+                capture_output=True, text=True, check=True)
+            got = np.load(out_path)
+            self.assertTrue(np.array_equal(got, expected))
+
+    def test_run_layer_cli_ping_reports_coordinators(self):
+        path, config = self._config()
+        x_path = os.path.join(self.tmp.name, "x3.npy")
+        out_path = os.path.join(self.tmp.name, "out3.npy")
+        np.save(x_path, np.ones(HIDDEN, dtype=np.float32))
+        with _Processes() as procs:
+            self._bring_up(procs, path, config)
+            result = subprocess.run(
+                [sys.executable, os.path.join(TOOLS, "run_layer.py"),
+                 "--config", path, "--layer", str(LAYER), "--token", "1",
+                 "--experts", "0", "--gates", "1.0",
+                 "--activation", x_path, "--output", out_path, "--ping",
+                 "--timeout", "10"],
+                capture_output=True, text=True, check=True)
+            for region_id in config.region_ids():
+                self.assertIn(region_id, result.stdout)
+
     def test_a_two_tier_config_refuses_to_serve_a_region(self):
         path = os.path.join(self.tmp.name, "two-tier.json")
         subprocess.run(
