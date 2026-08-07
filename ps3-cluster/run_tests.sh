@@ -3,5 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 make host
-python3 -m unittest discover -s tests -v
+# -W error::ResourceWarning: the suite opens real sockets, subprocesses and
+# reader threads, so a leaked fd is a bug and must fail rather than warn.
+python3 -W error::ResourceWarning -m unittest discover -s tests -v
 python3 tools/plan_k3.py
