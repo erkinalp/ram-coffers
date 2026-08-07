@@ -11,7 +11,8 @@ pooled P3XC connections with several requests in flight per node, and
 fixed order. ``subcluster.py`` groups nodes into Condor-style subclusters of 22
 for hierarchical fan-out, ``coordinator.py`` runs a real head-server process per
 subcluster, and ``hierarchy.py`` is the layer-side half that sends one batched
-request per subcluster.
+request per subcluster. Hierarchical dispatch is bit-identical to the flat path by
+default; ``fast=True`` trades that for a smaller upstream reply.
 """
 
 from .topology import (ModelProfile, ClusterPlan, KIMI_K3, plan_cluster,
@@ -27,8 +28,10 @@ from .subcluster import (SubclusterPlan, DEFAULT_SUBCLUSTER_SIZE,
 from .transport import (PersistentSocketTransport, PooledSocketTransport,
                         PendingRequest, PendingFrame)
 from .batch import (BatchEntry, BatchFailure, MAX_BATCH_ENTRIES,
+                    REQ_FLAG_FAST, RSP_FLAG_PER_EXPERT,
                     encode_batch_request, decode_batch_request,
-                    encode_batch_response, decode_batch_response,
+                    encode_batch_response, encode_batch_contributions,
+                    decode_batch_response,
                     encode_batch_error, decode_batch_error, decode_batch)
 from .coordinator import (SubclusterCoordinator, SubclusterServer,
                           SubclusterService, serve_subcluster)
@@ -49,8 +52,10 @@ __all__ = [
     "NodeConnectError", "NodeError", "NodeTimeout", "NodeDisconnected",
     "PoolExhausted", "TransportClosed", "SubclusterError",
     "PendingFrame", "BatchEntry", "BatchFailure", "MAX_BATCH_ENTRIES",
+    "REQ_FLAG_FAST", "RSP_FLAG_PER_EXPERT",
     "encode_batch_request", "decode_batch_request", "encode_batch_response",
-    "decode_batch_response", "encode_batch_error", "decode_batch_error",
+    "encode_batch_contributions", "decode_batch_response",
+    "encode_batch_error", "decode_batch_error",
     "decode_batch", "SubclusterCoordinator", "SubclusterServer",
     "SubclusterService", "serve_subcluster", "SubclusterTransport",
     "HierarchicalExpertDispatcher", "HierarchicalStage", "PendingBatch",

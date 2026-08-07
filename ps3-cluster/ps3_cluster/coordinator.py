@@ -17,14 +17,13 @@ coordinator talks to instead of talking to 22 consoles itself.
     expert workers                   (22 PS3s, one expert each)
         |  P3XC RSP
         v
-    SubclusterCoordinator  -- BRSP: one partial sum --> layer coordinator
+    SubclusterCoordinator  -- BRSP: gate_j * y_j per expert --> layer coordinator
 
-Why it matters on this hardware: the head server absorbs the k-way fan-out and
-returns ``sum_j gate_j * expert_j(x)`` for its own experts, so the layer
-coordinator's uplink carries one activation down and one partial back per
-subcluster instead of one per expert — the same reason ALF has the host enqueue
-one work-block list per accelerator rather than driving each SPE individually
-(ALF Programmer's Guide, SDK 3.0).
+Why it matters on this hardware: the head server absorbs the k-way fan-out, so
+the layer coordinator holds one connection per subcluster instead of one per
+console and sends the activation once per subcluster — the same reason ALF has
+the host enqueue one work-block list per accelerator rather than driving each
+SPE individually (ALF Programmer's Guide, SDK 3.0).
 
 Everything below the coordinator is reused, not reimplemented: the pooled
 persistent transport (``transport.py``), the concurrent fan-out and the
@@ -32,16 +31,25 @@ retry/replica policy (``dispatch.py``).
 
 Execution vs reduction semantics
 --------------------------------
-A subcluster answers a batch with **either** a partial sum covering every
-requested expert **or** a ``BERR`` naming the experts that failed and the
-consoles they live on. It never returns a short sum, so the layer coordinator
-cannot silently reduce a token through k-1 experts. Each contribution is scaled
-on the worker thread and summed in ascending expert-entry order, so the partial
-is bit-for-bit reproducible for a fixed request. Retries inside the subcluster
-follow ``RetryPolicy`` (default: only failures that provably never reached a
-console), and a late response to an abandoned request is dropped by the
-transport rather than summed — so a contribution is reduced exactly once even
-when the underlying call was executed twice.
+A subcluster answers a batch with **either** a result covering every requested
+expert **or** a ``BERR`` naming the experts that failed and the consoles they
+live on. It never returns a short answer, so the layer coordinator cannot
+silently reduce a token through k-1 experts.
+
+By default the answer is **one weighted contribution per expert**
+(``gate_j * y_j``, tagged with expert ``j``) and no summation happens here: the
+layer accumulates every subcluster's contributions strictly in top-k order, which
+is the only way the hierarchy can be bit-identical to the flat dispatcher — a
+token's positions interleave across subclusters, so folding a subset into one
+fp32 partial would re-associate the additions. A request that sets
+``REQ_FLAG_FAST`` instead gets one partial sum per subcluster (*fast* mode): less
+upstream bandwidth, but a changed reduction order, so logits and token choices
+can differ.
+
+Retries inside the subcluster follow ``RetryPolicy`` (default: only failures that
+provably never reached a console), and a late response to an abandoned request is
+dropped by the transport rather than reduced — so a contribution lands exactly
+once even when the underlying call was executed twice.
 """
 
 from __future__ import annotations
@@ -56,8 +64,8 @@ import numpy as np
 from .batch import (ERR_NODE_DISCONNECTED, ERR_NODE_ERROR, ERR_NODE_TIMEOUT,
                     ERR_NODE_UNREACHABLE, ERR_SHUTTING_DOWN, ERR_UNKNOWN,
                     ERR_UNKNOWN_EXPERT, ERR_BAD_REQUEST, BatchFailure,
-                    encode_batch_error, encode_batch_response,
-                    parse_batch_request)
+                    encode_batch_contributions, encode_batch_error,
+                    encode_batch_response, parse_batch_request)
 from .dispatch import (DistributedExpertDispatcher, ExpertPlacement,
                        RetryPolicy)
 from .errors import (NodeConnectError, NodeDisconnected, NodeError,
@@ -89,7 +97,7 @@ def failure_reason(exc: BaseException) -> int:
 
 
 class SubclusterCoordinator:
-    """Fans a batch out to this subcluster's consoles and reduces it.
+    """Fans a batch out to this subcluster's consoles and answers upstream.
 
     Parameters
     ----------
@@ -104,6 +112,10 @@ class SubclusterCoordinator:
     timeout:
         Ceiling on one downstream expert call; a request's ``deadline_ms``
         lowers it further.
+    allow_fast:
+        Whether to honour ``REQ_FLAG_FAST`` and answer with a single partial sum.
+        True by default (a layer has to ask for it); set False on a head server
+        that must never hand back a re-associated sum.
     """
 
     def __init__(self, group_id: str, placement: ExpertPlacement,
@@ -111,10 +123,12 @@ class SubclusterCoordinator:
                  timeout: float = DEFAULT_TIMEOUT,
                  max_workers: Optional[int] = None,
                  retry_policy: Optional[RetryPolicy] = None,
-                 transport: Optional[PersistentSocketTransport] = None):
+                 transport: Optional[PersistentSocketTransport] = None,
+                 allow_fast: bool = True):
         self.group_id = group_id
         self.placement = placement
         self.timeout = timeout
+        self.allow_fast = allow_fast
         self._owns_transport = transport is None
         self.transport = (PersistentSocketTransport(endpoints, timeout=timeout)
                           if transport is None else transport)
@@ -126,6 +140,7 @@ class SubclusterCoordinator:
         #: Observability, asserted by the tests.
         self.batches_served = 0
         self.experts_called = 0
+        self.fast_batches = 0
 
     # -- membership --------------------------------------------------------
     def member_nodes(self, layer: Optional[int] = None) -> List[str]:
@@ -161,6 +176,12 @@ class SubclusterCoordinator:
                 f"{self.group_id} does not hold "
                 f"{len(missing)} of {len(entries)} requested experts")
 
+        fast = bool(msg.get("fast"))
+        if fast and not self.allow_fast:
+            return encode_batch_error(
+                layer, token_id, ERR_BAD_REQUEST,
+                detail=f"{self.group_id} does not serve fast "
+                       f"(partial-sum) batches")
         timeout = self.timeout
         if msg.get("deadline_ms"):
             timeout = min(timeout, msg["deadline_ms"] / 1000.0)
@@ -180,6 +201,8 @@ class SubclusterCoordinator:
         with self._lock:
             self.batches_served += 1
             self.experts_called += len(entries)
+            if fast:
+                self.fast_batches += 1
         if errors:
             failures = []
             for position in sorted(errors):
@@ -190,9 +213,16 @@ class SubclusterCoordinator:
             return encode_batch_error(layer, token_id, failures[0].reason,
                                       failures,
                                       str(errors[min(errors)])[:400])
-        return encode_batch_response(layer, token_id,
-                                     stage.reduce(contributions),
-                                     len(entries))
+        if fast:
+            return encode_batch_response(layer, token_id,
+                                         stage.reduce(contributions),
+                                         len(entries))
+        # Exact mode: hand the weighted contributions up untouched, tagged with
+        # their experts, and let the layer sum them in its own top-k order.
+        positions = sorted(contributions)
+        return encode_batch_contributions(
+            layer, token_id, [contributions[p] for p in positions],
+            [entries[p].expert for p in positions])
 
     # -- teardown ----------------------------------------------------------
     def close(self) -> None:
@@ -333,10 +363,11 @@ def serve_subcluster(group_id: str, placement: ExpertPlacement,
                      endpoints: Dict[str, Tuple[str, int]],
                      host: str = "0.0.0.0", port: int = 0,
                      timeout: float = DEFAULT_TIMEOUT,
-                     retry_policy: Optional[RetryPolicy] = None
-                     ) -> SubclusterService:
+                     retry_policy: Optional[RetryPolicy] = None,
+                     allow_fast: bool = True) -> SubclusterService:
     """Build (but do not start) a subcluster service."""
     coordinator = SubclusterCoordinator(group_id, placement, endpoints,
                                         timeout=timeout,
-                                        retry_policy=retry_policy)
+                                        retry_policy=retry_policy,
+                                        allow_fast=allow_fast)
     return SubclusterService(coordinator, host=host, port=port)

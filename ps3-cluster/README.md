@@ -89,7 +89,7 @@ implements it:
 
 ```
 layer coordinator ── BREQ (activation once + [(expert, gate)…]) ──▶ head server
-                 ◀────────────── BRSP (one partial sum) ──────────┤  (per 22)
+                 ◀── BRSP (one gate·y row per expert, tagged) ─────┤  (per 22)
                                                                   ├─▶ 22 consoles
                                         P3XC REQ/RSP, pooled, concurrent
 ```
@@ -113,6 +113,8 @@ python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
 python3 tools/run_subcluster.py --config cluster.json --list
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
     --check-members                      # PING every console behind this head
+python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
+    --refuse-fast                        # serve exact batches only
 ```
 
 The layer coordinator reads the same file and talks only to the heads:
@@ -141,18 +143,27 @@ Properties, all covered by `tests/test_hierarchy.py` over real sockets:
   sends the involved heads' batches together.
 - **Multiple batches per upstream connection**, correlated by
   `(layer, 0xFFFF, token_id)`, so replies may come back out of order.
-- **All-or-error partials**: a subcluster returns a sum covering *every*
+- **All-or-error responses**: a subcluster answers for *every*
   requested expert (after any configured replica failover) or a `BERR` naming
   the failed experts and their consoles, raised as `SubclusterError` with
-  `safe_to_retry` set only when no expert can have run. A short sum is never
-  reduced. Passing `replicas=[...]` pins entries to standby consoles when the
+  `safe_to_retry` set only when no expert can have run. A short response is
+  never reduced. Passing `replicas=[...]` pins entries to standby consoles when the
   layer already knows a primary is down.
-- **Numerics**: contributions are summed in ascending expert order inside a
-  subcluster and partials in ascending group order — bit-identical to the
-  in-process `hierarchical_reduce`, and bit-identical to the flat sum when one
-  subcluster covers the stage. Grouping otherwise re-associates float32
-  additions, so a multi-subcluster result can differ from the flat sum in the
-  last bits.
+- **Numerics (exact by default)**: a head server does *not* reduce. Its `BRSP`
+  carries one `gate_j * y_j` row per expert, tagged with the expert it belongs
+  to, and the layer accumulates them in ascending original top-k position with
+  the same float32 additions as `DistributedExpertDispatcher`. The hierarchical
+  result is therefore bit-identical to the flat one — `np.array_equal`, not
+  `allclose` — no matter how the top-k positions interleave across subclusters
+  or in what order the consoles finish. The cost is upstream bandwidth: `k`
+  vectors instead of one per subcluster (the activation still travels once).
+- **`fast=True` (opt-in, approximate)**: `HierarchicalExpertDispatcher(...,
+  fast=True)`, or per call `run_expert_stage(..., fast=True)`, sets a request
+  flag that asks each head server for a single partial sum instead. That
+  re-associates the float32 additions when a group holds a non-contiguous slice
+  of the top-k, so **logits and therefore token choices can change**. Never the
+  default; a head server started with `--refuse-fast` rejects such batches with
+  `ERR_BAD_REQUEST`.
 - The flat `DistributedExpertDispatcher` and the canonical
   one-expert-per-layer-per-node placement are unchanged; a head server is an
   overlay, not a placement authority.

@@ -21,7 +21,7 @@ an expert worker's parser is untouched — it simply never receives these types.
 
     <P3XC header, expert=0xFFFF, array=activation>
     n_entries   : uint16                 <= MAX_BATCH_ENTRIES
-    flags       : uint16                 reserved, must be 0
+    flags       : uint16                 REQ_FLAG_FAST only; other bits must be 0
     deadline_ms : uint32                 layer's budget, 0 = coordinator default
     entries     : n_entries * {
         expert      : uint16
@@ -30,13 +30,30 @@ an expert worker's parser is untouched — it simply never receives these types.
         gate        : float32            big-endian gate weight
     }
 
-``BRSP`` (partial sum upward), ``msg_type=7``:
+``BRSP`` (results upward), ``msg_type=7``, in one of two shapes:
 
-    <P3XC header, expert=0xFFFF, array=partial sum>
-    n_reduced   : uint16                 experts actually summed
-    flags       : uint16                 reserved, must be 0
+    exact (default; flags = RSP_FLAG_PER_EXPERT):
+        <P3XC header, expert=0xFFFF, array=float32 [n_reduced, <activation>]>
+        n_reduced   : uint16             rows, one weighted contribution each
+        flags       : uint16             RSP_FLAG_PER_EXPERT
+        experts     : n_reduced * uint16 which expert each row belongs to
 
-``n_reduced`` lets the layer coordinator assert that the partial covers every
+    fast (only if the request set REQ_FLAG_FAST; flags = 0):
+        <P3XC header, expert=0xFFFF, array=partial sum>
+        n_reduced   : uint16             experts folded into the sum
+        flags       : uint16             0
+
+The **exact** shape is the default because collapsing a subcluster's experts into
+one fp32 partial re-associates the additions: a token's top-k positions
+interleave across subclusters, so per-subcluster partials cannot be summed back
+into the flat left-to-right order. One row per expert, tagged with the expert it
+came from, lets the layer accumulate strictly in top-k order with the same fp32
+operations as the flat dispatcher, so the hierarchy is bit-identical to it. The
+cost is upstream bandwidth: k rows instead of one. The **fast** shape trades that
+identity for the smaller reply, must be requested explicitly, and can change
+logits and therefore token choices.
+
+``n_reduced`` lets the layer coordinator assert that the reply covers every
 expert it asked for: a subcluster must never silently return a short sum.
 
 ``deadline_ms`` propagates the layer's remaining budget downward: the subcluster
@@ -79,6 +96,16 @@ MAX_BATCH_ENTRIES = 1024
 
 #: Bound on any string (node id, error detail) carried in a BERR frame.
 MAX_STRING_BYTES = 512
+
+#: ``BREQ`` flag: answer with one partial sum instead of per-expert rows. Opt-in
+#: only - it re-associates the layer's fp32 reduction (see above).
+REQ_FLAG_FAST = 0x0001
+REQ_FLAG_MASK = REQ_FLAG_FAST
+
+#: ``BRSP`` flag: the array holds one weighted contribution per expert, tagged
+#: with its expert id, rather than a single partial sum. Set on exact replies.
+RSP_FLAG_PER_EXPERT = 0x0001
+RSP_FLAG_MASK = RSP_FLAG_PER_EXPERT
 
 #: ``expert`` field for frames that address a subcluster rather than an expert.
 NO_EXPERT = 0xFFFF
@@ -124,8 +151,12 @@ class BatchFailure(NamedTuple):
 # -- requests ---------------------------------------------------------------
 def encode_batch_request(layer: int, token_id: int, x: np.ndarray,
                          entries: Sequence[BatchEntry],
-                         deadline_ms: int = 0) -> bytes:
-    """Encode a BREQ: the activation once, plus the ``(expert, gate)`` list."""
+                         deadline_ms: int = 0, fast: bool = False) -> bytes:
+    """Encode a BREQ: the activation once, plus the ``(expert, gate)`` list.
+
+    ``fast`` asks for a single partial sum instead of per-expert contributions,
+    giving up bit-identity with the flat reduction.
+    """
     if not entries:
         raise ProtocolError("batch request needs at least one entry")
     if len(entries) > MAX_BATCH_ENTRIES:
@@ -133,7 +164,8 @@ def encode_batch_request(layer: int, token_id: int, x: np.ndarray,
                             f"{MAX_BATCH_ENTRIES}")
     if not 0 <= deadline_ms <= MAX_DEADLINE_MS:
         raise ProtocolError(f"deadline_ms {deadline_ms} out of range")
-    trailer = [_REQ_HEAD.pack(len(entries), 0, deadline_ms)]
+    trailer = [_REQ_HEAD.pack(len(entries), REQ_FLAG_FAST if fast else 0,
+                              deadline_ms)]
     for entry in entries:
         if not 0 <= entry.expert <= 0xFFFF:
             raise ProtocolError(f"expert {entry.expert} out of range")
@@ -156,7 +188,7 @@ def parse_batch_request(msg: dict) -> dict:
     if len(trailer) < _REQ_HEAD.size:
         raise ProtocolError("batch request is missing its entry count")
     n_entries, flags, deadline_ms = _REQ_HEAD.unpack_from(trailer, 0)
-    if flags != 0:
+    if flags & ~REQ_FLAG_MASK:
         raise ProtocolError(f"unsupported batch flags {flags:#x}")
     if n_entries == 0:
         raise ProtocolError("batch request has no entries")
@@ -180,13 +212,14 @@ def parse_batch_request(msg: dict) -> dict:
         entries.append(BatchEntry(expert=expert, gate=gate, replica=replica))
     msg["entries"] = entries
     msg["deadline_ms"] = deadline_ms
+    msg["fast"] = bool(flags & REQ_FLAG_FAST)
     return msg
 
 
 # -- responses --------------------------------------------------------------
 def encode_batch_response(layer: int, token_id: int, partial: np.ndarray,
                           n_reduced: int) -> bytes:
-    """Encode a BRSP carrying one subcluster's partial sum."""
+    """Encode a *fast* BRSP carrying one subcluster's partial sum."""
     if n_reduced < 1 or n_reduced > MAX_BATCH_ENTRIES:
         raise ProtocolError(f"n_reduced {n_reduced} out of range")
     return encode(MSG_BRSP, layer, NO_EXPERT, token_id,
@@ -194,22 +227,72 @@ def encode_batch_response(layer: int, token_id: int, partial: np.ndarray,
                   _COUNT.pack(n_reduced, 0))
 
 
+def encode_batch_contributions(layer: int, token_id: int,
+                               contributions: Sequence[np.ndarray],
+                               experts: Sequence[int]) -> bytes:
+    """Encode an *exact* BRSP: one weighted contribution per expert.
+
+    ``contributions[i]`` is ``gate_i * expert_i(x)`` exactly as the flat
+    dispatcher computes it, and ``experts[i]`` says which expert it belongs to,
+    so the layer can put it back at its own top-k position.
+    """
+    if len(contributions) != len(experts):
+        raise ProtocolError("contribution/expert length mismatch")
+    if not contributions:
+        raise ProtocolError("batch response covers no experts")
+    if len(contributions) > MAX_BATCH_ENTRIES:
+        raise ProtocolError(f"{len(contributions)} contributions exceeds "
+                            f"{MAX_BATCH_ENTRIES}")
+    rows = np.stack([np.ascontiguousarray(c, dtype=np.float32)
+                     for c in contributions])
+    tags = [_COUNT.pack(len(contributions), RSP_FLAG_PER_EXPERT)]
+    for expert in experts:
+        if not 0 <= expert <= 0xFFFF:
+            raise ProtocolError(f"expert {expert} out of range")
+        tags.append(struct.pack("!H", expert))
+    return encode(MSG_BRSP, layer, NO_EXPERT, token_id, rows, b"".join(tags))
+
+
 def decode_batch_response(body: bytes) -> dict:
     return parse_batch_response(_decode_typed(body, MSG_BRSP))
 
 
 def parse_batch_response(msg: dict) -> dict:
+    """Parse either BRSP shape, exposing ``per_expert`` and ``experts``."""
     _require_type(msg, MSG_BRSP)
     trailer = msg["trailer"]
-    if len(trailer) != _COUNT.size:
-        raise ProtocolError(f"batch response trailer is {len(trailer)} bytes, "
-                            f"expected {_COUNT.size}")
+    if len(trailer) < _COUNT.size:
+        raise ProtocolError("batch response is missing its header")
     n_reduced, flags = _COUNT.unpack_from(trailer, 0)
-    if flags != 0:
+    if flags & ~RSP_FLAG_MASK:
         raise ProtocolError(f"unsupported batch flags {flags:#x}")
     if n_reduced == 0:
         raise ProtocolError("batch response reduced no experts")
+    if n_reduced > MAX_BATCH_ENTRIES:
+        raise ProtocolError(f"n_reduced {n_reduced} exceeds "
+                            f"{MAX_BATCH_ENTRIES}")
+    per_expert = bool(flags & RSP_FLAG_PER_EXPERT)
+    experts: List[int] = []
+    if per_expert:
+        expected = _COUNT.size + 2 * n_reduced
+        if len(trailer) != expected:
+            raise ProtocolError(f"batch response trailer is {len(trailer)} "
+                                f"bytes, expected {expected} for {n_reduced} "
+                                f"contributions")
+        experts = list(struct.unpack_from("!%dH" % n_reduced, trailer,
+                                          _COUNT.size))
+        if len(set(experts)) != len(experts):
+            raise ProtocolError("an expert is tagged twice in one response")
+        rows = msg["array"]
+        if rows.ndim < 2 or rows.shape[0] != n_reduced:
+            raise ProtocolError(f"batch response array {rows.shape} does not "
+                                f"hold {n_reduced} contributions")
+    elif len(trailer) != _COUNT.size:
+        raise ProtocolError(f"batch response trailer is {len(trailer)} bytes, "
+                            f"expected {_COUNT.size}")
     msg["n_reduced"] = n_reduced
+    msg["per_expert"] = per_expert
+    msg["experts"] = experts
     return msg
 
 
