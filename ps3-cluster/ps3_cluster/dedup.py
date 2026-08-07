@@ -2,13 +2,16 @@
 
 A caller that loses its answer cannot tell whether the coordinator died before
 or after driving its downstream work. Retrying is therefore *at-least-once
-execution* in general — unless the retry reaches the same coordinator process,
-which is exactly what an ordered endpoint list makes likely: a head server
-listening on two addresses, or a reconnect after the socket dropped, is the same
-process with the same memory.
+execution* in general. A reconnect after a dropped socket reaches the same
+coordinator process and can use the same in-memory cache; the same is true if a
+single process programmatically listens on multiple addresses. Normal
+``run_subcluster.py --standby N`` / ``run_region.py --standby N`` invocations are
+separate processes with separate caches, so a retry that reaches them cannot be
+deduplicated without shared state and is at-least-once execution.
 
-This cache turns that case back into exactly-once execution. A batch carries a
-64-bit request id (``REQ_FLAG_REQUEST_ID``); the coordinator runs the batch under
+This cache turns the same-process case back into exactly-once execution.
+
+A batch carries a 64-bit request id (``REQ_FLAG_REQUEST_ID``); the coordinator runs the batch under
 that id and remembers the encoded response frame, so a retry of the same logical
 batch gets the first attempt's bytes instead of a second fan-out. A retry that
 arrives while the first attempt is still running waits for it rather than racing
@@ -220,8 +223,12 @@ class DedupCache:
         with self._lock:
             if size > self.max_bytes:
                 # Honest: too large to cache; still answer, but don't retain.
+                # Pop the slot so later retries re-execute and memory/capacity
+                # are released; waiters already woken hold a reference and get
+                # this first result.
                 slot.cached = False
                 self.oversized += 1
+                self._slots.pop(request_id, None)
                 return
             self._make_bytes_locked(size)
             self._bytes += size

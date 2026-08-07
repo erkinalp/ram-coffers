@@ -213,7 +213,7 @@ python3 tools/gen_cluster_config.py --layer 3 --experts 88 \
 
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
-    --standby 0                          # second address of the same head
+    --standby 0                          # independent standby for same subcluster
 python3 tools/run_region.py --config cluster.json --region rg-0000
 python3 tools/run_region.py --config cluster.json --region rg-0000 --standby 0
 python3 tools/run_region.py --config cluster.json --list
@@ -231,13 +231,19 @@ python3 tools/run_layer.py --config cluster.json --layer 3 --token 0 \
     --retry-ambiguous --timeout 30.0
 ```
 
-`--standby N` serves a coordinator's Nth extra address, so it needs those
-addresses to exist: `--head-standby N` / `--region-standby N` above declare them,
-numbered in the next block of ports after the primaries on the same host. That is
-right for a laptop bring-up and a starting point for a farm — pass
-`--head-standby-host` / `--region-standby-host`, or edit the `standby` blocks, so
-a standby does not share a machine with the primary it covers. Without them
-`--standby 0` exits with `rg-0000 has 0 standby addresses, no index 0`.
+`--standby N` starts an *independent* coordinator process that fronts the same
+subcluster/region as the primary, listening on the Nth extra address in the
+config. It has its own memory and its own bounded dedup cache; it is not the same
+process as the primary. Same-process deduplication only happens when a single
+process listens on multiple addresses programmatically, or when a dropped socket
+reconnects to the same process. Because normal primary/standby deployments are
+separate processes, a retry that reaches the standby is at-least-once execution
+(the caller still reduces exactly one complete answer). The config generator
+creates the standby block as the next port block on the same host for laptop
+bring-ups; for a production farm pass `--head-standby-host` / `--region-standby-host`,
+or edit the `standby` blocks, so a standby does not share a machine with the
+primary it covers. Without standby addresses `--standby N` exits with
+`rg-0000 has 0 standby addresses, no index N`.
 
 `run_region.py` takes most of the same options as `run_subcluster.py` except
 that the layer→region link uses `--retry-ambiguous` instead of the per-expert
