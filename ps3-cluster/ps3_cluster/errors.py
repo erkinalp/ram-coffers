@@ -97,7 +97,10 @@ class SubclusterError(TransportError):
 
     ``safe_to_retry`` is true only when every named failure provably never ran
     an expert (unreachable node, malformed request, coordinator shutting down),
-    which keeps a layer-level retry at-most-once.
+    which keeps a layer-level retry at-most-once. It says a retry cannot
+    double-count, not that one would succeed: `ERR_UNKNOWN_EXPERT` and
+    `ERR_BAD_REQUEST` are permanent, so a caller that retries should still bound
+    its attempts and treat those codes as a configuration fault.
     """
 
     def __init__(self, node_id: str, code: int,
