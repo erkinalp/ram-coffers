@@ -17,6 +17,33 @@ class TestTopology(unittest.TestCase):
         self.assertEqual(plan.experts_split_across, 1)
         self.assertLessEqual(plan.per_expert_mb, T.PS3_USABLE_RAM_MB)
 
+    def test_default_is_one_expert_per_node(self):
+        # The canonical design: exactly one expert/node even though more fit.
+        plan = T.plan_cluster(T.KIMI_K3)
+        self.assertEqual(plan.experts_per_node, 1)
+        self.assertEqual(plan.expert_nodes, 82432)
+        self.assertGreater(plan.capacity_experts_per_node, 1)  # 200MB/19MB
+
+    def test_rsx_widens_capacity_but_not_default_placement(self):
+        # RSX (GameOS exploit) adds hot capacity; placement still 1/node unless asked.
+        base = T.plan_cluster(T.KIMI_K3)
+        rsx = T.plan_cluster(T.KIMI_K3, rsx=True)
+        self.assertGreater(rsx.node_capacity_mb, base.node_capacity_mb)
+        self.assertGreater(rsx.capacity_experts_per_node, base.capacity_experts_per_node)
+        self.assertEqual(rsx.expert_nodes, 82432)  # still 1/node by default
+        self.assertTrue(any("GameOS" in w for w in rsx.warnings))
+
+    def test_packing_reduces_node_count(self):
+        # Opt into 2 experts/node -> ~half the expert nodes.
+        plan = T.plan_cluster(T.KIMI_K3, experts_per_node=2)
+        self.assertEqual(plan.experts_per_node, 2)
+        self.assertEqual(plan.expert_nodes, (82432 + 1) // 2)
+
+    def test_packing_clamped_to_capacity(self):
+        plan = T.plan_cluster(T.KIMI_K3, experts_per_node=9999)
+        self.assertEqual(plan.experts_per_node, plan.capacity_experts_per_node)
+        self.assertTrue(any("clamping" in w for w in plan.warnings))
+
     def test_k3_node_count(self):
         plan = T.plan_cluster(T.KIMI_K3)
         # 82,432 expert nodes + 92 layer coordinators + embed/lm_head shards.

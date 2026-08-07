@@ -24,6 +24,16 @@ from typing import Dict, List, Optional
 PS3_TOTAL_RAM_MB = 256
 PS3_USABLE_RAM_MB = 200  # after hypervisor/kernel/runtime overhead
 
+# RSX GDDR3: 256 MB total, ~240 MB usable after the framebuffer. Two very
+# different regimes:
+#   - OtherOS (hypervisor): mappable but READ bandwidth is ~16 MB/s, so it is
+#     unusable for weights read every token. Treat as cold capacity only ->
+#     do NOT add it to the hot per-node budget by default.
+#   - GameOS exploit (AsbestOS): full ~22.4 GB/s access + programmable shaders,
+#     so it is a genuine second tier that can hold hot experts.
+PS3_RSX_RAM_MB = 256
+PS3_RSX_USABLE_MB = 240
+
 
 @dataclass
 class ModelProfile:
@@ -81,6 +91,10 @@ class ClusterPlan:
     active_nodes_per_token: int    # how many consoles light up per token
     idle_fraction: float
     per_expert_mb: float
+    node_capacity_mb: float = 0.0            # hot RAM per node (XDR [+ RSX])
+    experts_per_node: int = 1                # placement choice (design = 1)
+    capacity_experts_per_node: int = 1       # how many could fit at capacity
+    rsx: bool = False
     warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
@@ -95,18 +109,58 @@ def _split_factor(item_bytes: int, usable_bytes: int) -> int:
 
 
 def plan_cluster(model: ModelProfile,
-                 usable_ram_mb: int = PS3_USABLE_RAM_MB) -> ClusterPlan:
-    """Compute a 1-expert x 1-layer / node placement plan for ``model``."""
+                 usable_ram_mb: int = PS3_USABLE_RAM_MB,
+                 rsx: bool = False,
+                 rsx_usable_mb: int = PS3_RSX_USABLE_MB,
+                 experts_per_node: int = 1) -> ClusterPlan:
+    """Compute a placement plan for ``model``.
+
+    Defaults to the canonical **1 expert x 1 layer / node** design: one expert
+    resident in a node's XDR RAM, everything else headroom (activations, KV,
+    runtime). ``rsx=True`` models a GameOS-exploit boot where the RSX's ~240 MB
+    GDDR3 is a usable hot tier (full ~22.4 GB/s), widening per-node capacity;
+    ``experts_per_node`` opts into packing multiple experts on one console to
+    trade node count for per-node load (only valid up to the capacity the plan
+    reports as ``capacity_experts_per_node``).
+    """
     usable_bytes = usable_ram_mb * 1024 * 1024
     warnings: List[str] = []
 
-    expert_split = _split_factor(model.expert_bytes, usable_bytes)
+    # Hot capacity per node: XDR only under OtherOS; XDR + RSX under GameOS.
+    node_capacity_bytes = usable_bytes
+    if rsx:
+        node_capacity_bytes += rsx_usable_mb * 1024 * 1024
+        warnings.append(
+            "rsx=True assumes a GameOS exploit (AsbestOS) for full-speed RSX "
+            "access; under OtherOS the RSX reads at ~16 MB/s and cannot hold hot "
+            "experts (cold storage only)")
+
+    expert_split = _split_factor(model.expert_bytes, node_capacity_bytes)
     if expert_split > 1:
         warnings.append(
             f"one expert ({model.expert_bytes/2**20:.1f} MB) exceeds a node's "
-            f"{usable_ram_mb} MB; splitting each expert across {expert_split} nodes")
+            f"{node_capacity_bytes/2**20:.0f} MB; splitting each expert across "
+            f"{expert_split} nodes")
 
-    expert_nodes = model.total_experts * expert_split
+    # How many whole experts a node *could* hold at this capacity (informational).
+    capacity_experts_per_node = max(1, node_capacity_bytes // model.expert_bytes)
+    if experts_per_node < 1:
+        experts_per_node = 1
+    if experts_per_node > capacity_experts_per_node:
+        warnings.append(
+            f"experts_per_node={experts_per_node} exceeds capacity "
+            f"({capacity_experts_per_node} fit in {node_capacity_bytes/2**20:.0f} MB); "
+            f"clamping")
+        experts_per_node = capacity_experts_per_node
+
+    if expert_split > 1:
+        expert_nodes = model.total_experts * expert_split
+    else:
+        expert_nodes = (model.total_experts + experts_per_node - 1) // experts_per_node
+        if experts_per_node > 1:
+            warnings.append(
+                f"packing {experts_per_node} experts/node -> "
+                f"{expert_nodes:,} expert nodes (vs {model.total_experts:,} at 1/node)")
     layer_nodes = model.n_layers  # one coordinator per layer holds resident modules
 
     if model.resident_bytes_per_layer > usable_bytes:
@@ -121,7 +175,9 @@ def plan_cluster(model: ModelProfile,
     total = expert_nodes + layer_nodes + io_nodes
 
     # Per token: top_k experts per layer light up, plus each layer coordinator,
-    # plus the embed + lm_head shards.
+    # plus the embed + lm_head shards. With experts packed together, the number
+    # of distinct nodes touched can be lower (co-resident experts), but bound it
+    # simply by the activations dispatched.
     active = (model.top_k * expert_split * model.n_layers
               + layer_nodes + io_nodes)
     idle_fraction = 1.0 - (active / total) if total else 0.0
@@ -137,6 +193,10 @@ def plan_cluster(model: ModelProfile,
         active_nodes_per_token=active,
         idle_fraction=idle_fraction,
         per_expert_mb=model.expert_bytes / 2**20,
+        node_capacity_mb=node_capacity_bytes / 2**20,
+        experts_per_node=experts_per_node,
+        capacity_experts_per_node=capacity_experts_per_node,
+        rsx=rsx,
         warnings=warnings,
     )
 

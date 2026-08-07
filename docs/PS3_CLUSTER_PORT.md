@@ -106,6 +106,18 @@ ps3-cluster/
   store each → weights must be DMA-streamed in tiles, never resident whole.
 - **256 MB XDR RAM** per console is the binding constraint and the reason the
   placement unit is a single expert.
+- **RSX GDDR3 (256 MB, ~240 MB usable)** is a *conditional* second tier:
+  - Under **OtherOS** it is mappable via the hypervisor but reads at only
+    ~16 MB/s, so it is useless for weights read every token — cold storage at
+    best. XDR stays the binding constraint and placement stays 1 expert/node.
+  - Under a **GameOS exploit (AsbestOS)** you get full ~22.4 GB/s access *and*
+    the programmable NV47/G70 shader pipeline, making RSX a genuine hot tier: a
+    node can hold ~2 experts (one in XDR, one in RSX) and could even run the
+    expert GEMV as RSX fragment shaders instead of on the SPEs. The planner
+    models this with `plan_cluster(..., rsx=True)` /
+    `tools/plan_k3.py --rsx`, which widens per-node capacity (200 → 440 MB) and
+    reports how many experts fit; packing is opt-in via `experts_per_node` so
+    the default stays the canonical 1-expert/node design.
 
 ## Building & testing
 
