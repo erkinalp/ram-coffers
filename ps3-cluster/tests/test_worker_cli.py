@@ -62,34 +62,37 @@ class TestWorkerCli(unittest.TestCase):
             path = os.path.join(tmp, "e.exp")
             (gp, up, dp), hidden, inter = self._packed(path)
             port = _free_port()
-            proc = subprocess.Popen(
-                [sys.executable, CLI, path, "--host", "127.0.0.1",
-                 "--port", str(port)],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            transport = PersistentSocketTransport({"c": ("127.0.0.1", port)},
-                                                  timeout=10.0)
-            try:
-                x = np.arange(hidden, dtype=np.float32) * 0.01
-                deadline = time.time() + 15
-                while True:
-                    try:
-                        y = transport.dispatch("c", 3, 1, 5, x)
-                        break
-                    except TransportError:
-                        if time.time() > deadline:
-                            raise
-                        time.sleep(0.1)
-                np.testing.assert_allclose(
-                    y, pack_expert.reference_forward(gp, up, dp, hidden,
-                                                     inter, x),
-                    rtol=1e-5, atol=1e-5)
-                # Same connection, second request: the CLI keeps serving.
-                transport.dispatch("c", 3, 1, 6, x)
-                self.assertGreater(transport.ping("c"), 0.0)
-            finally:
-                transport.close()
-                proc.terminate()
-                self.assertEqual(proc.wait(20), 0)
+            # Popen as a context manager so the stdout pipe is closed even if an
+            # assertion fails; a leaked pipe shows up as a ResourceWarning.
+            with subprocess.Popen(
+                    [sys.executable, CLI, path, "--host", "127.0.0.1",
+                     "--port", str(port)],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True) as proc:
+                transport = PersistentSocketTransport(
+                    {"c": ("127.0.0.1", port)}, timeout=10.0)
+                try:
+                    x = np.arange(hidden, dtype=np.float32) * 0.01
+                    deadline = time.time() + 15
+                    while True:
+                        try:
+                            y = transport.dispatch("c", 3, 1, 5, x)
+                            break
+                        except TransportError:
+                            if time.time() > deadline:
+                                raise
+                            time.sleep(0.1)
+                    np.testing.assert_allclose(
+                        y, pack_expert.reference_forward(gp, up, dp, hidden,
+                                                         inter, x),
+                        rtol=1e-5, atol=1e-5)
+                    # Same connection, second request: the CLI keeps serving.
+                    transport.dispatch("c", 3, 1, 6, x)
+                    self.assertGreater(transport.ping("c"), 0.0)
+                finally:
+                    transport.close()
+                    proc.terminate()
+                    self.assertEqual(proc.wait(20), 0)
 
 
 if __name__ == "__main__":
