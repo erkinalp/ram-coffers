@@ -1,0 +1,71 @@
+/*
+ * expert_rsx.cg - RSX (NV47 / G70-class, Shader Model 3.0) fragment shader:
+ * one MXFP4 GEMV row per fragment, for the GameOS-exploit boot path where the
+ * PS3's RSX GPU is fully programmable (libgcm / PSGL / RSXGL).
+ *
+ * Mapping (see rsx_gemv_emu.h for the exact CPU model this must match):
+ *   - The output vector is a Wx1 render target; fragment y = output row r.
+ *   - wtex  : R8 texture, width = row_bytes, height = rows. Row r holds the
+ *             MXFP4-packed bytes for weight row r (1 scale byte + 16 nibble
+ *             bytes per 32-element block).
+ *   - xtex  : R32F texture, width = n (the dense fp32 input vector).
+ *   - luttex: 16x1 R32F texture, the E2M1 magnitude/sign table (MXFP4_LUT).
+ *   - Uniforms: n (input dim), nblocks = n/32, row_bytes, and texel sizes.
+ *
+ * G70 fragment pipeline is fp32-capable with SM3.0 dynamic loops; a full K3
+ * row (n=7168 -> 224 blocks) is a long loop and may need tiling on real
+ * hardware (accumulate partial sums across passes). Kept single-pass here for
+ * clarity; the host driver can split rows into column tiles if the shader
+ * exceeds instruction/loop limits.
+ */
+
+float fetch_byte(sampler2D wtex, float x, float row, float inv_w, float inv_h) {
+    // R8 texture is normalised [0,1]; recover the integer byte value.
+    float v = tex2D(wtex, float2((x + 0.5) * inv_w, (row + 0.5) * inv_h)).r;
+    return floor(v * 255.0 + 0.5);
+}
+
+float lut(sampler2D luttex, float code) {
+    // 16-entry LUT along width; nearest sampling.
+    return tex2D(luttex, float2((code + 0.5) / 16.0, 0.5)).r;
+}
+
+void main(
+    float2 texcoord      : TEXCOORD0,   // .y selects the output row (0..rows-1)
+    uniform sampler2D wtex,
+    uniform sampler2D xtex,
+    uniform sampler2D luttex,
+    uniform float rows,
+    uniform float n,
+    uniform float nblocks,
+    uniform float row_bytes,
+    uniform float inv_wtex_w,
+    uniform float inv_wtex_h,
+    uniform float inv_xtex_w,
+    out float4 color     : COLOR)
+{
+    float row = floor(texcoord.y * rows);
+    float acc = 0.0;
+
+    for (float b = 0.0; b < nblocks; b += 1.0) {
+        float base = b * 17.0;                       // 17 bytes per block
+        float e = fetch_byte(wtex, base, row, inv_wtex_w, inv_wtex_h);
+        float scale = exp2(e - 127.0);               // E8M0 -> multiplier
+
+        for (float i = 0.0; i < 16.0; i += 1.0) {    // 16 packed bytes / block
+            float byte = fetch_byte(wtex, base + 1.0 + i, row,
+                                    inv_wtex_w, inv_wtex_h);
+            float lo = fmod(byte, 16.0);
+            float hi = floor(byte / 16.0);
+
+            float col0 = b * 32.0 + i * 2.0;
+            float x0 = tex2D(xtex, float2((col0 + 0.5) * inv_xtex_w, 0.5)).r;
+            float x1 = tex2D(xtex, float2((col0 + 1.5) * inv_xtex_w, 0.5)).r;
+
+            acc += lut(luttex, lo) * scale * x0;
+            acc += lut(luttex, hi) * scale * x1;
+        }
+    }
+
+    color = float4(acc, 0.0, 0.0, 1.0);
+}
