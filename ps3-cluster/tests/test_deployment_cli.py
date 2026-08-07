@@ -83,6 +83,32 @@ def _wait_for(transport, group_id, deadline=25.0):
             time.sleep(0.1)
 
 
+def _run_checked(args, **kwargs):
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("check", True)
+    try:
+        return subprocess.run(args, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        raise AssertionError(
+            f"command failed (exit {exc.returncode}): {args}\n"
+            f"--- stdout ---\n{exc.stdout}\n"
+            f"--- stderr ---\n{exc.stderr}"
+        ) from exc
+
+
+def _wait_for_coordinators(config, deadline=25.0):
+    """PING all head or region servers before invoking a layer CLI."""
+    endpoints = (config.region_endpoints() if config.regions
+                 else config.group_endpoints())
+    transport = SubclusterTransport(endpoints, timeout=20.0)
+    try:
+        for group_id in sorted(endpoints):
+            _wait_for(transport, group_id, deadline=deadline)
+    finally:
+        transport.close()
+
+
 class TestThreeTierDeploymentCli(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -106,7 +132,7 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
         path = os.path.join(self.tmp.name, "cluster.json")
         head_base = free_port()
         region_base = free_port()
-        out = subprocess.run(
+        out = _run_checked(
             [sys.executable, os.path.join(TOOLS, "gen_cluster_config.py"),
              "--layer", str(LAYER), "--experts", str(N_EXPERTS),
              "--size", "1", "--expert-host", "127.0.0.1",
@@ -114,8 +140,7 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
              "--regions", "2", "--region-host", "127.0.0.1",
              "--region-port-base", str(region_base)]
             + (["--region-standby", "1"] if standby else [])
-            + ["-o", path],
-            capture_output=True, text=True, check=True)
+            + ["-o", path])
         self.assertIn("2 regions", out.stdout)
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -208,10 +233,9 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
 
     def test_list_and_check_members_report_the_tree(self):
         path, config = self._config(standby=False)
-        listed = subprocess.run(
+        listed = _run_checked(
             [sys.executable, os.path.join(TOOLS, "run_region.py"),
-             "--config", path, "--list"],
-            capture_output=True, text=True, check=True)
+             "--config", path, "--list"])
         for region_id in config.region_ids():
             self.assertIn(region_id, listed.stdout)
         with _Processes() as procs:
@@ -223,11 +247,10 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
                     _wait_for(transport, region_id)
             finally:
                 transport.close()
-            checked = subprocess.run(
+            checked = _run_checked(
                 [sys.executable, os.path.join(TOOLS, "run_region.py"),
                  "--config", path, "--region", config.region_ids()[0],
-                 "--check-members"],
-                capture_output=True, text=True, check=True)
+                 "--check-members"])
             self.assertEqual(
                 json.loads(checked.stdout),
                 {g: True for g in config.region("rg-0000").subclusters})
@@ -243,25 +266,25 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
         with _Processes() as procs:
             self._bring_up(procs, path, config)
             expected = self._flat_reference(config, x, experts, gates)
-            subprocess.run(
+            _wait_for_coordinators(config)
+            _run_checked(
                 [sys.executable, os.path.join(TOOLS, "run_layer.py"),
                  "--config", path, "--layer", str(LAYER), "--token", "7"]
                 + ["--experts"] + [str(e) for e in experts]
                 + ["--gates"] + [str(g) for g in gates]
                 + ["--activation", x_path, "--output", out_path,
-                   "--timeout", "20"],
-                capture_output=True, text=True, check=True)
+                   "--timeout", "20"])
             got = np.load(out_path)
             self.assertTrue(np.array_equal(got, expected))
 
     def test_run_layer_cli_matches_flat_dispatcher_two_tier(self):
         path = os.path.join(self.tmp.name, "two-tier.json")
-        subprocess.run(
+        _run_checked(
             [sys.executable, os.path.join(TOOLS, "gen_cluster_config.py"),
              "--layer", str(LAYER), "--experts", str(N_EXPERTS),
              "--size", "1", "--expert-host", "127.0.0.1",
              "--head-host", "127.0.0.1", "--head-port-base", str(free_port()),
-             "-o", path], capture_output=True, text=True, check=True)
+             "-o", path])
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)
         for spec, port in zip(doc["subclusters"], self.expert_ports):
@@ -283,14 +306,14 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
                 procs.start([os.path.join(TOOLS, "run_subcluster.py"),
                              "--config", path, "--subcluster", spec.group_id])
             expected = self._flat_reference(config, x, experts, gates)
-            subprocess.run(
+            _wait_for_coordinators(config)
+            _run_checked(
                 [sys.executable, os.path.join(TOOLS, "run_layer.py"),
                  "--config", path, "--layer", str(LAYER), "--token", "9"]
                 + ["--experts"] + [str(e) for e in experts]
                 + ["--gates"] + [str(g) for g in gates]
                 + ["--activation", x_path, "--output", out_path,
-                   "--timeout", "20"],
-                capture_output=True, text=True, check=True)
+                   "--timeout", "20"])
             got = np.load(out_path)
             self.assertTrue(np.array_equal(got, expected))
 
@@ -301,22 +324,22 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
         np.save(x_path, np.ones(HIDDEN, dtype=np.float32))
         with _Processes() as procs:
             self._bring_up(procs, path, config)
-            result = subprocess.run(
+            _wait_for_coordinators(config)
+            result = _run_checked(
                 [sys.executable, os.path.join(TOOLS, "run_layer.py"),
                  "--config", path, "--layer", str(LAYER), "--token", "1",
                  "--experts", "0", "--gates", "1.0",
                  "--activation", x_path, "--output", out_path, "--ping",
-                 "--timeout", "10"],
-                capture_output=True, text=True, check=True)
+                 "--timeout", "10"])
             for region_id in config.region_ids():
                 self.assertIn(region_id, result.stdout)
 
     def test_a_two_tier_config_refuses_to_serve_a_region(self):
         path = os.path.join(self.tmp.name, "two-tier.json")
-        subprocess.run(
+        _run_checked(
             [sys.executable, os.path.join(TOOLS, "gen_cluster_config.py"),
              "--layer", str(LAYER), "--experts", "2", "--size", "1",
-             "-o", path], capture_output=True, text=True, check=True)
+             "-o", path])
         failed = subprocess.run(
             [sys.executable, os.path.join(TOOLS, "run_region.py"),
              "--config", path, "--region", "rg-0000"],
