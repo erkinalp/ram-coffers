@@ -18,6 +18,13 @@ Frame layout (all integers big-endian / ``!``):
     ndim      : uint8
     shape     : ndim * uint32
     payload   : product(shape) * itemsize bytes, big-endian elements
+    trailer   : optional, frame-type-specific bytes to the end of the body
+
+Expert-worker frames (REQ/RSP/ERR/PING/PONG) never carry a trailer, so an
+expert node's parser is unchanged. The subcluster frames in ``batch.py`` use
+the trailer to carry their ``(expert, gate)`` list after the single shared
+activation; anything that only needs the header and array can decode them with
+this module and ignore the trailer.
 
 This module has no third-party dependencies beyond numpy so it can run on a
 stock OtherOS Python as well as on the coordinator.
@@ -36,6 +43,17 @@ MSG_RSP = 2
 MSG_ERR = 3
 MSG_PING = 4
 MSG_PONG = 5
+#: Subcluster frames (see ``batch.py``): batched request, partial-sum response,
+#: structured error. Only spoken between a layer coordinator and a subcluster
+#: coordinator; expert workers never see them.
+MSG_BREQ = 6
+MSG_BRSP = 7
+MSG_BERR = 8
+
+#: Refuse to allocate for a frame larger than this (matches the C worker's
+#: limit in ``ppu/expert_ppu.c``), so a bad length prefix cannot exhaust a
+#: console's 256 MB of XDR RAM.
+MAX_FRAME_BYTES = 1 << 26
 
 # Compact dtype tags. MXFP4 payloads travel packed (uint8) and are expanded on
 # the node, exactly as AirLLM #316 keeps MXFP4 packed across PCIe; here the
@@ -71,8 +89,12 @@ def _dtype_tag(arr: np.ndarray) -> int:
 
 
 def encode(msg_type: int, layer: int, expert: int, token_id: int,
-           arr: np.ndarray) -> bytes:
-    """Serialise one frame to length-prefixed big-endian bytes."""
+           arr: np.ndarray, trailer: bytes = b"") -> bytes:
+    """Serialise one frame to length-prefixed big-endian bytes.
+
+    ``trailer`` is appended verbatim after the array payload; it is empty for
+    every expert-worker frame type.
+    """
     arr = np.ascontiguousarray(arr)
     dtype_tag = _dtype_tag(arr)
     # Force big-endian element order on the wire regardless of host endianness.
@@ -84,7 +106,10 @@ def encode(msg_type: int, layer: int, expert: int, token_id: int,
                           dtype_tag, len(shape))
     shape_bytes = struct.pack("!%dI" % len(shape), *shape)
     payload = be.tobytes(order="C")
-    body = header + shape_bytes + payload
+    body = header + shape_bytes + payload + trailer
+    if len(body) > MAX_FRAME_BYTES:
+        raise ProtocolError(f"frame of {len(body)} bytes exceeds the "
+                            f"{MAX_FRAME_BYTES} byte limit")
     return struct.pack("!I", len(body)) + body
 
 
@@ -99,13 +124,19 @@ def decode(body: bytes) -> dict:
     if version != VERSION:
         raise ProtocolError(f"version mismatch {version}")
     off = _HEADER.size
+    if len(body) < off + 4 * ndim:
+        raise ProtocolError("truncated shape")
     shape = struct.unpack_from("!%dI" % ndim, body, off)
     off += 4 * ndim
+    if dtype_tag not in _DTYPE_TO_NP:
+        raise ProtocolError(f"unsupported dtype tag {dtype_tag}")
     np_dtype = _DTYPE_TO_NP[dtype_tag]
     count = 1
     for s in shape:
         count *= s
     end = off + count * np_dtype.itemsize
+    if len(body) < end:
+        raise ProtocolError("truncated payload")
     arr = np.frombuffer(body[off:end], dtype=np_dtype).reshape(shape)
     # Return a native-endian, writable copy so callers can compute on it.
     arr = np.ascontiguousarray(arr.astype(arr.dtype.newbyteorder("=")))
@@ -115,6 +146,7 @@ def decode(body: bytes) -> dict:
         "expert": expert,
         "token_id": token_id,
         "array": arr,
+        "trailer": body[end:],
     }
 
 
@@ -122,6 +154,8 @@ def read_frame(recv) -> dict:
     """Read one framed message using a ``recv(n) -> bytes`` callable."""
     raw_len = _recv_exact(recv, 4)
     (length,) = struct.unpack("!I", raw_len)
+    if length == 0 or length > MAX_FRAME_BYTES:
+        raise ProtocolError(f"refusing a {length} byte frame")
     body = _recv_exact(recv, length)
     return decode(body)
 

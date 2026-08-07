@@ -352,16 +352,32 @@ class PersistentSocketTransport(Transport):
                        for pool in self._pools.values())
 
     # -- request path -----------------------------------------------------
+    def submit_raw(self, node_id: str, key: CorrelationKey, frame: bytes,
+                   count: bool = True) -> "PendingFrame":
+        """Write an arbitrary P3XC frame and return a handle for its reply.
+
+        The connection machinery is frame-agnostic: correlation only needs the
+        peer to echo ``(layer, expert, token_id)``, which the subcluster frames
+        in ``batch.py`` do as well. This is the hook the hierarchical transport
+        uses so it does not have to duplicate the pool or the reader threads.
+
+        ``count=False`` keeps the frame out of ``requests_sent``, which counts
+        work sent to a node rather than heartbeats.
+        """
+        conn = self._acquire(node_id, key)
+        pending = conn.send(key, frame)
+        if count:  # heartbeats are not work; they must not skew the counter
+            with self._lock:
+                self.requests_sent[node_id] = (
+                    self.requests_sent.get(node_id, 0) + 1)
+        return PendingFrame(conn, pending, node_id, self._timeout)
+
     def submit(self, node_id: str, layer: int, expert: int, token_id: int,
                x: np.ndarray) -> "PendingRequest":
         """Write a REQ frame and return a handle to await the response."""
         key: CorrelationKey = (layer, expert, token_id)
         frame = encode(MSG_REQ, layer, expert, token_id, x)
-        conn = self._acquire(node_id, key)
-        pending = conn.send(key, frame)
-        with self._lock:
-            self.requests_sent[node_id] = self.requests_sent.get(node_id, 0) + 1
-        return PendingRequest(self, conn, pending, node_id, self._timeout)
+        return PendingRequest(self.submit_raw(node_id, key, frame))
 
     def dispatch(self, node_id: str, layer: int, expert: int, token_id: int,
                  x: np.ndarray) -> np.ndarray:
@@ -383,10 +399,9 @@ class PersistentSocketTransport(Transport):
         key: CorrelationKey = (0xFFFF, 0xFFFF, token_id)
         frame = encode(MSG_PING, 0xFFFF, 0xFFFF, token_id,
                        np.zeros(1, np.float32))
-        conn = self._acquire(node_id, key)
         started = time.monotonic()
-        pending = conn.send(key, frame)
-        msg = conn.wait(pending, deadline)
+        msg = self.submit_raw(node_id, key, frame,
+                              count=False).message(deadline)
         if msg["msg_type"] != MSG_PONG:
             raise NodeError(node_id, msg["layer"], msg["expert"],
                             msg["token_id"])
@@ -416,20 +431,18 @@ class PersistentSocketTransport(Transport):
         self.close()
 
 
-class PendingRequest:
-    """Handle for one in-flight expert call on a persistent connection."""
+class PendingFrame:
+    """Handle for one in-flight frame on a persistent connection."""
 
-    __slots__ = ("_transport", "_conn", "_pending", "node_id", "_timeout",
-                 "_result")
+    __slots__ = ("_conn", "_pending", "node_id", "_timeout", "_message")
 
-    def __init__(self, transport: PersistentSocketTransport, conn: _Connection,
-                 pending: _Pending, node_id: str, timeout: float):
-        self._transport = transport
+    def __init__(self, conn: _Connection, pending: _Pending, node_id: str,
+                 timeout: float):
         self._conn = conn
         self._pending = pending
         self.node_id = node_id
         self._timeout = timeout
-        self._result: Optional[np.ndarray] = None
+        self._message: Optional[dict] = None
 
     @property
     def key(self) -> CorrelationKey:
@@ -438,12 +451,44 @@ class PendingRequest:
     def done(self) -> bool:
         return self._pending.event.is_set()
 
+    def message(self, timeout: Optional[float] = None) -> dict:
+        """Block for the decoded reply frame, raising a node-specific error."""
+        if self._message is None:
+            self._message = self._conn.wait(
+                self._pending,
+                self._timeout if timeout is None else timeout)
+        return self._message
+
+    def cancel(self) -> None:
+        """Abandon the request; a late response is dropped by the reader."""
+        self._conn.cancel(self._pending)
+
+
+class PendingRequest:
+    """Handle for one in-flight expert call on a persistent connection."""
+
+    __slots__ = ("_frame", "_result")
+
+    def __init__(self, frame: PendingFrame):
+        self._frame = frame
+        self._result: Optional[np.ndarray] = None
+
+    @property
+    def node_id(self) -> str:
+        return self._frame.node_id
+
+    @property
+    def key(self) -> CorrelationKey:
+        return self._frame.key
+
+    def done(self) -> bool:
+        return self._frame.done()
+
     def result(self, timeout: Optional[float] = None) -> np.ndarray:
         """Block for the response array, raising a node-specific error."""
         if self._result is not None:
             return self._result
-        msg = self._conn.wait(self._pending,
-                              self._timeout if timeout is None else timeout)
+        msg = self._frame.message(timeout)
         if msg["msg_type"] == MSG_ERR:
             raise NodeError(self.node_id, msg["layer"], msg["expert"],
                             msg["token_id"])
@@ -455,7 +500,7 @@ class PendingRequest:
 
     def cancel(self) -> None:
         """Abandon the request; a late response is dropped by the reader."""
-        self._conn.cancel(self._pending)
+        self._frame.cancel()
 
 
 #: ``PooledSocketTransport`` is the migration alias for code that wants the

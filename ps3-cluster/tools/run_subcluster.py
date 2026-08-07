@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Run one subcluster coordinator (head server) from a cluster config.
+
+    # on the head server that fronts sc-0000's 22 consoles
+    python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
+
+    # what does this config contain?
+    python3 tools/run_subcluster.py --config cluster.json --list
+
+    # are my consoles up? (PING/PONG each one, then exit)
+    python3 tools/run_subcluster.py --config cluster.json \
+        --subcluster sc-0000 --check-members
+
+The process listens for P3XC batch frames from the layer coordinator, keeps
+persistent pooled connections to its own consoles, and answers each batch with a
+single partial sum. Ctrl-C drains in-flight batches and closes every socket.
+"""
+import argparse
+import json
+import os
+import signal
+import sys
+import threading
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ps3_cluster.coordinator import SubclusterCoordinator, SubclusterService
+from ps3_cluster.deployment import ClusterConfig
+from ps3_cluster.dispatch import RetryPolicy
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True,
+                    help="cluster config JSON (see ps3_cluster/deployment.py)")
+    ap.add_argument("--subcluster", help="subcluster id to serve")
+    ap.add_argument("--host", help="override the configured listen host")
+    ap.add_argument("--port", type=int, help="override the configured port")
+    ap.add_argument("--timeout", type=float, default=30.0,
+                    help="ceiling on one downstream expert call, seconds")
+    ap.add_argument("--attempts", type=int, default=2,
+                    help="tries per expert; retried only when a failure "
+                         "provably never reached a console")
+    ap.add_argument("--list", action="store_true",
+                    help="print the config's subclusters and exit")
+    ap.add_argument("--check-members", action="store_true",
+                    help="PING every console in the subcluster and exit")
+    args = ap.parse_args()
+
+    config = ClusterConfig.load(args.config)
+    if args.list:
+        for spec in config.subclusters:
+            print(f"{spec.group_id}\t{spec.endpoint[0]}:{spec.endpoint[1]}\t"
+                  f"{len(spec.members)} consoles")
+        return 0
+    if not args.subcluster:
+        ap.error("--subcluster is required unless --list is given")
+    spec = config.subcluster(args.subcluster)
+
+    coordinator = SubclusterCoordinator(
+        spec.group_id, config.placement(spec.group_id),
+        config.expert_endpoints(spec.group_id), timeout=args.timeout,
+        retry_policy=RetryPolicy(attempts=args.attempts))
+
+    if args.check_members:
+        try:
+            print(json.dumps(coordinator.check_members(), indent=2,
+                             sort_keys=True))
+        finally:
+            coordinator.close()
+        return 0
+
+    host_arg = args.host or spec.endpoint[0]
+    port_arg = spec.endpoint[1] if args.port is None else args.port
+    service = SubclusterService(coordinator, host=host_arg,
+                                port=port_arg).start()
+    host, port = service.address
+    print(f"{spec.group_id} listening on {host}:{port} for "
+          f"{len(spec.members)} consoles", flush=True)
+
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    try:
+        stop.wait()
+    finally:
+        service.stop()
+        print(f"{spec.group_id} stopped after "
+              f"{coordinator.batches_served} batches", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

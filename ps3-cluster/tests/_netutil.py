@@ -232,6 +232,109 @@ class HangUpServer:
         self.close()
 
 
+class FrameTap:
+    """Byte-counting P3XC proxy in front of a real service.
+
+    Sits between a layer coordinator and a subcluster coordinator on loopback
+    and records every frame body travelling upstream (client -> service) plus
+    the byte totals each way, so a test can assert what actually went over the
+    wire — e.g. that a subcluster request carries the activation once rather
+    than once per expert.
+    """
+
+    def __init__(self, target, host="127.0.0.1"):
+        self.target = target
+        self.frames_up = []
+        self.bytes_up = 0
+        self.bytes_down = 0
+        self.accepted = 0
+        self._lock = threading.Lock()
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind((host, 0))
+        self._sock.listen(8)
+        self.host, self.port = self._sock.getsockname()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    @property
+    def endpoint(self):
+        return (self.host, self.port)
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                client, _ = self._sock.accept()
+            except OSError:
+                return
+            with self._lock:
+                self.accepted += 1
+            try:
+                upstream = socket.create_connection(self.target, timeout=5)
+            except OSError:
+                client.close()
+                continue
+            threading.Thread(target=self._pump_up, args=(client, upstream),
+                             daemon=True).start()
+            threading.Thread(target=self._pump_down, args=(upstream, client),
+                             daemon=True).start()
+
+    def _pump_up(self, client, upstream):
+        """Forward client -> service, parsing frames as they pass."""
+        try:
+            while True:
+                head = _recv_exact(client, 4)
+                if head is None:
+                    return
+                (length,) = struct.unpack("!I", head)
+                body = _recv_exact(client, length)
+                if body is None:
+                    return
+                with self._lock:
+                    self.frames_up.append(body)
+                    self.bytes_up += 4 + len(body)
+                upstream.sendall(head + body)
+        except OSError:
+            return
+        finally:
+            for sock in (client, upstream):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def _pump_down(self, upstream, client):
+        try:
+            while True:
+                chunk = upstream.recv(65536)
+                if not chunk:
+                    return
+                with self._lock:
+                    self.bytes_down += len(chunk)
+                client.sendall(chunk)
+        except OSError:
+            return
+
+    def frames_of_type(self, msg_type):
+        with self._lock:
+            return [body for body in self.frames_up if body[5] == msg_type]
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
 def _recv_exact(conn, n):
     buf = b""
     while len(buf) < n:

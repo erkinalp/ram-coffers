@@ -18,6 +18,16 @@ The ``safe_to_retry`` class attribute encodes whether the request can be re-sent
 
 from __future__ import annotations
 
+from typing import List, Sequence
+
+from .batch import (ERR_BAD_REQUEST, ERR_NODE_UNREACHABLE, ERR_SHUTTING_DOWN,
+                    ERR_UNKNOWN_EXPERT, BatchFailure)
+
+#: BERR reasons that prove no expert ran, so a layer-level retry stays
+#: at-most-once.
+_NEVER_RAN = frozenset({ERR_NODE_UNREACHABLE, ERR_BAD_REQUEST,
+                        ERR_SHUTTING_DOWN, ERR_UNKNOWN_EXPERT})
+
 
 class TransportError(RuntimeError):
     """Base class for node-attributed transport failures."""
@@ -74,3 +84,36 @@ class NodeDisconnected(TransportError):
 
 class TransportClosed(TransportError):
     """The transport (or one of its connections) was closed locally."""
+
+
+class SubclusterError(TransportError):
+    """A subcluster coordinator refused or could not complete a batch.
+
+    Carries the ``BERR`` code and the per-expert failure list (see
+    ``batch.py``), so the layer coordinator learns *which* consoles behind the
+    head server failed and why. A subcluster never returns a partial sum that
+    silently omits an expert: it either delivers every selected contribution or
+    raises this.
+
+    ``safe_to_retry`` is true only when every named failure provably never ran
+    an expert (unreachable node, malformed request, coordinator shutting down),
+    which keeps a layer-level retry at-most-once.
+    """
+
+    def __init__(self, node_id: str, code: int,
+                 failures: Sequence[BatchFailure] = (), detail: str = ""):
+        named = ", ".join(f"expert {f.expert} on {f.node_id} (reason {f.reason})"
+                          for f in failures) or "no expert named"
+        super().__init__(node_id,
+                         f"subcluster batch failed with code {code}: {named}"
+                         + (f": {detail}" if detail else ""))
+        self.code = code
+        self.failures: List[BatchFailure] = list(failures)
+        self.detail = detail
+
+    @property
+    def safe_to_retry(self) -> bool:  # type: ignore[override]
+        if not self.failures:
+            # No expert was named, so only the overall code can justify a retry.
+            return self.code in _NEVER_RAN
+        return all(f.reason in _NEVER_RAN for f in self.failures)

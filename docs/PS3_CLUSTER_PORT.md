@@ -186,11 +186,112 @@ order, answers membership queries, and buckets a token's active nodes by group.
 a head server would forward upstream — and sums the partials in group order,
 reporting each partial through an `on_partial` callback.
 
-This is deliberately *only* a grouping and reduction plan: it does not change
-placement (canonical 1 expert × 1 layer / node is untouched), does not introduce
-MPI or any other dependency, and the coordinator still speaks P3XC directly to
-each console. Actually running a coordinator process per subcluster is future
-work that this abstraction is meant to make mechanical.
+`subcluster.py` itself is only the grouping and reduction plan: it does not
+change placement (canonical 1 expert × 1 layer / node is untouched) and adds no
+dependency. The processes that use it are below.
+
+### Deployed subcluster coordinators
+
+`coordinator.py` turns that grouping into Condor's actual process topology: one
+head-server process per subcluster, with the layer coordinator talking to heads
+instead of to consoles.
+
+```
+            layer coordinator  (hierarchy.py: HierarchicalExpertDispatcher)
+              |                       |
+     BREQ (activation once   +  [(expert, gate), ...]),  one per subcluster,
+     sent to the involved heads concurrently, several batches per connection
+              v                       v
+     head server sc-0000        head server sc-0001      (coordinator.py:
+     SubclusterCoordinator      SubclusterCoordinator     SubclusterService)
+       | | | ... (<=22)           | | | ... (<=22)
+     P3XC REQ/RSP over the *same* pooled persistent transport as the flat path,
+     fanned out concurrently, gate-scaled, summed in ascending expert order
+              |                       |
+     BRSP: one partial sum      BRSP: one partial sum
+              \_______________________/
+                          v
+            layer sums partials in ascending group id order
+```
+
+**Wire format (`batch.py`).** Three new P3XC message types reuse the existing
+fixed big-endian header and array payload plus a type-specific trailer, so an
+expert worker's parser is untouched (it simply never sees these types) and
+length prefixing is unchanged:
+
+| Type | Value | Body |
+|---|---|---|
+| `BREQ` | 6 | header (`expert=0xFFFF`) + activation + `n_entries:u16`, `flags:u16` (must be 0), `deadline_ms:u32`, then `n_entries × {expert:u16, replica:u8, reserved:u8, gate:f32}` |
+| `BRSP` | 7 | header + partial sum + `n_reduced:u16`, `flags:u16` |
+| `BERR` | 8 | header + `[0.0]` + `code:u16`, `n_failures:u16`, then `n_failures × {expert:u16, reason:u16, node_len:u16, node bytes}`, then `detail_len:u16` + UTF-8 detail |
+
+The activation travels **once per subcluster request** — 8 bytes per additional
+expert instead of another 28 KB at K3 width (hidden 7168, fp32) — which is the
+same reason ALF has the host enqueue one work-block descriptor list per
+accelerator rather than one message per SPE. Every count and string is bounded
+(`MAX_BATCH_ENTRIES`, `MAX_STRING_BYTES`, `MAX_FRAME_BYTES`, `MAX_DEADLINE_MS`),
+reserved fields must be zero, duplicate experts in one batch are rejected, and
+`read_frame` refuses a zero-length or oversized length prefix *before*
+allocating, so a corrupt or hostile frame cannot make a head server allocate
+without limit. A malformed `BREQ` is answered with `BERR ERR_BAD_REQUEST` on the
+same connection; an unrecoverable framing error drops the connection.
+
+**Lifecycle.** An upstream connection is persistent and carries many batches:
+each `BREQ` is executed on the head server's own pool, so replies may come back
+out of order, correlated by `(layer, 0xFFFF, token_id)` — the identity the
+pooled transport already keys on, which is why the layer side is a thin wrapper
+over `PersistentSocketTransport` rather than a second transport. `PING` is
+answered by the head server itself (a `PONG` means *this coordinator* is up;
+`SubclusterCoordinator.check_members()` probes the 22 consoles). A request's
+`deadline_ms` bounds the head server's downstream calls to
+`min(deadline, its own timeout)`, so a stuck console cannot hold an upstream
+request past the layer's budget. `SubclusterService.stop()` stops accepting,
+drains in-flight batches, joins the accept thread, and closes the downstream
+transport and its reader threads.
+
+**Execution vs reduction semantics.** A subcluster returns either a partial
+covering *every* requested expert (after any configured replica failover) or a
+`BERR` naming each failed expert, its reason and its console — surfaced to the
+layer as `SubclusterError`, whose `safe_to_retry` is true only when every named
+failure provably never ran an expert. A short sum is never produced and never
+reduced: the layer also verifies `n_reduced` against the number of experts it
+asked for. Retries inside a subcluster follow the same `RetryPolicy` as the flat
+path, and a late response to an abandoned request is dropped by the transport
+rather than summed, so each contribution is reduced exactly once even if the
+underlying call executed twice. An entry's `replica` byte pins that expert to a
+standby console (0 = the canonical one), so a layer that already knows the
+primary is down does not pay the failed attempt again; a hint naming a replica
+that is not configured is answered `BERR ERR_BAD_REQUEST` rather than silently
+falling back to the primary.
+
+**Numerics.** Contributions are summed in ascending expert order within a
+subcluster and partials in ascending group-id order — bit-identical to the
+in-process `hierarchical_reduce`, and bit-identical to the flat top-k sum when a
+single subcluster covers the stage. With several subclusters the grouping
+re-associates float32 additions, so the result may differ from the flat sum in
+the last bits; both orders are fixed and reproducible.
+
+**Configuration (`deployment.py`).** One JSON document declares which head
+server fronts which consoles, and both ends read it, so the two sides cannot
+disagree about who owns an expert:
+
+```json
+{"subcluster_size": 22,
+ "subclusters": [{"id": "sc-0000", "host": "10.0.1.1", "port": 8100,
+                  "members": [{"layer": 3, "expert": 0,
+                              "node": "ps3-L003-E0000",
+                              "host": "10.0.0.10", "port": 9000,
+                              "replicas": [{"node": "ps3-L003-E0000-b",
+                                            "host": "10.0.0.210",
+                                            "port": 9000}]}]}]}
+```
+
+`ClusterConfig` derives the canonical placement (replicas additive, never extra
+experts), the console endpoints, the head endpoints, and a `SubclusterPlan` built
+from the *declared* membership. `tools/gen_cluster_config.py` writes such a file
+for a layer, and `tools/run_subcluster.py --config … --subcluster sc-0000` runs
+one head server (`--list`, `--check-members` for inspection). No MPI, no external
+runtime; CPU-only hosts included.
 
 ### Failure semantics
 
@@ -316,6 +417,9 @@ timing-sensitive:
 | `test_async_dispatch.py` | top-k experts running simultaneously (a barrier that a serial dispatcher cannot satisfy — with `max_workers=1` as the control), bit-identical reduction, error cleanup, liveness |
 | `test_subcluster.py` | grouping into 22s, stability, partial/hierarchical reduction, dispatch reduced through two subclusters |
 | `test_failover.py` | replica registration, safe-only retries, `ERR`/timeout policies, and per-node request counts proving no expert is counted twice |
+| `test_batch_protocol.py` | batch frame round-trips, activation carried once regardless of k, bounded counts/strings, reserved-field and duplicate-expert rejection, truncation, version mismatch, expert-frame compatibility |
+| `test_deployment.py` | JSON config round-trip, canonical placement with additive replicas, plan built from declared membership, size/duplicate validation, 22-console grouping |
+| `test_hierarchy.py` | two live head servers over four consoles: partial sums bit-identical to in-process grouped reduction (and to flat dispatch with one subcluster), one `BREQ` per subcluster with the activation appearing exactly once on the wire (asserted through a byte-counting proxy), barriers proving concurrency within *and* across subclusters, two batches multiplexed on one upstream connection, upstream/downstream connection reuse, head-server and console heartbeats, malformed/oversized/unsupported frames, unreachable and erroring consoles as structured `BERR`, replica failover counting an expert once, deadline propagation, and socket/thread cleanup after `stop()` |
 
 On real hardware, `make ps3` (with the
 [ps3dev toolchain](https://github.com/ps3dev/ps3toolchain)) builds the identical
@@ -325,14 +429,15 @@ cannot tell a simulated node from a real console.
 ## Status
 
 MVP. The dispatch layer, persistent pooled transport, concurrent top-k fan-out,
-heartbeats, subcluster planner, retry/failover hooks, wire protocol, MXFP4
+heartbeats, subcluster planner, deployable per-subcluster coordinator processes
+with their batched wire format and JSON membership config, retry/failover hooks,
+wire protocol, MXFP4
 kernel, SwiGLU FFN, topology planner, host-sim worker, SPE kernel, and RSX shader
 backend (with a CPU-validated shader model) are implemented; the numeric path is tested end to
 end against a numpy reference. Not yet done: a coordinator shim that hangs
 `DistributedExpertDispatcher` off a real transformers `forward` via #316's hook
-points (documented in `ps3-cluster/README.md`), a coordinator process per
-subcluster (the planner describes the grouping but fan-out is still flat from one
-coordinator), dependency-scheduled multi-stage work queues à la ALF, load-aware
+points (documented in `ps3-cluster/README.md`), dependency-scheduled multi-stage
+work queues à la ALF, load-aware
 replica selection, AltiVec-vectorised SPU dequant,
 column-tiling the RSX shader for full-width K3 rows, and validation on physical
 PS3 hardware (both the SPE and RSX paths compile only against their toolchains,
@@ -342,6 +447,16 @@ the CPU shader model).
 The coordination layer is validated on loopback sockets only. Nothing here has
 run on a physical PlayStation 3, and the latency/bandwidth characteristics of a
 real console farm (100 Mbit NICs, OtherOS hypervisor overhead) are not modelled.
+
+Further limitations of the deployed hierarchy specifically: the tree is two
+levels (layer → head → console) with no head-of-heads tier and no failover
+*between* head servers — a dead head server fails its subcluster's batches, and
+recovering means the layer retrying or the operator restarting it; head servers
+hold no state, so a restart is safe. Batching is per subcluster per token, not
+across tokens, and there is no load-aware choice among replicas. A multi-
+subcluster hierarchical sum is reproducible but not bit-identical to the flat
+sum (see numerics above). Requests on one console connection remain sequential,
+as before.
 
 ## Prior art
 
