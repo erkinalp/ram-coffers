@@ -2,7 +2,7 @@
 
 ## Commit
 
-`TBD` on branch `kimi-k3-async-coordination` (doc/CLI audit cleanup).
+`7f3b66f` on branch `kimi-k3-async-coordination` (doc/CLI audit cleanup).
 
 ## Scope
 
