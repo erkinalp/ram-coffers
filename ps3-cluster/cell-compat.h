@@ -87,6 +87,14 @@ static inline void cell_bswap_f16_array(uint16_t *a, size_t n) {
 #define CELL_SPE_USABLE      (6)               /* OtherOS; 7 with GameOS exploit */
 #define CELL_MAIN_RAM_BYTES  (256UL * 1024 * 1024)
 
+/* RSX GDDR3: 256 MB, ~240 MB usable after the framebuffer. Under OtherOS it is
+ * mappable via the hypervisor but reads at ~16 MB/s (write-fast, read-slow), so
+ * it is cold storage only -- never place hot, per-token weights there. Under a
+ * GameOS exploit (AsbestOS) it is a full-speed (~22.4 GB/s) hot tier. */
+#define CELL_RSX_RAM_BYTES        (256UL * 1024 * 1024)
+#define CELL_RSX_USABLE_BYTES     (240UL * 1024 * 1024)
+#define CELL_RSX_OTHEROS_READ_BPS (16UL * 1024 * 1024)   /* advisory: read-slow */
+
 #define GGML_CELL_COMPAT_ACTIVE 1
 
 #endif /* GGML_PS3_CELL */

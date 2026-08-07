@@ -13,16 +13,24 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--usable-mb", type=int, default=T.PS3_USABLE_RAM_MB)
+    ap.add_argument("--rsx", action="store_true",
+                    help="model a GameOS-exploit boot with full-speed RSX GDDR3 as a hot tier")
+    ap.add_argument("--experts-per-node", type=int, default=1,
+                    help="pack N experts per console (default 1 = the canonical design)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
-    plan = T.plan_cluster(T.KIMI_K3, a.usable_mb)
+    plan = T.plan_cluster(T.KIMI_K3, a.usable_mb, rsx=a.rsx,
+                          experts_per_node=a.experts_per_node)
     if a.json:
         print(json.dumps(plan.to_dict(), indent=2))
         return
-    print("PS3 cluster plan for Kimi K3 (1 expert x 1 layer / node)")
+    boot = "GameOS-exploit + RSX" if plan.rsx else "OtherOS (XDR only)"
+    print(f"PS3 cluster plan for Kimi K3 ({plan.experts_per_node} expert x 1 layer / node)")
+    print(f"  boot path            : {boot}")
     print("=" * 56)
-    print(f"  usable RAM/node      : {plan.usable_ram_mb} MB")
+    print(f"  hot RAM/node         : {plan.node_capacity_mb:.0f} MB")
     print(f"  per-expert (MXFP4)   : {plan.per_expert_mb:.1f} MB")
+    print(f"  experts fit / node   : {plan.capacity_experts_per_node}")
     print(f"  expert nodes         : {plan.expert_nodes:,}")
     print(f"  layer-coordinator    : {plan.layer_nodes:,}")
     print(f"  embed/lm_head nodes  : {plan.io_nodes:,}")
