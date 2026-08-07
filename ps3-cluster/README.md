@@ -23,7 +23,10 @@ python3 tools/plan_k3.py                     # size the cluster for Kimi K3
   instead of local disk loads, fanning the top-k calls out concurrently;
   `transport.py` holds persistent pooled P3XC connections with several requests
   in flight per node; `subcluster.py` groups nodes into Condor-style
-  subclusters of 22 for hierarchical fan-out; `errors.py` is the
+  subclusters of 22 for hierarchical fan-out; `coordinator.py` runs a real head
+  server per subcluster and `hierarchy.py` is the layer-side half that sends one
+  batched request per subcluster (`batch.py` is that wire format,
+  `deployment.py` the JSON membership config); `errors.py` is the
   node-attributed failure hierarchy; `topology.py` plans the 1-expert/node
   layout; `protocol.py` is the big-endian wire codec; `node.py` is a reference
   (numpy) expert worker.
@@ -76,6 +79,72 @@ y = dispatcher.run_expert_stage(layer, x, expert_ids, gate_weights, token_id)
 alive = dispatcher.check_liveness(dispatcher.active_nodes_for(layer, expert_ids))
 dispatcher.close(); transport.close()
 ```
+
+## Deployed hierarchy (subcluster coordinators)
+
+Condor, the 1,716-console AFRL cluster, was wired as **subclusters of 22 PS3s
+behind a coordinating server**; the heads absorbed the fan-out and aggregated
+upward. That is a process topology, not just a grouping, and `coordinator.py`
+implements it:
+
+```
+layer coordinator ── BREQ (activation once + [(expert, gate)…]) ──▶ head server
+                 ◀────────────── BRSP (one partial sum) ──────────┤  (per 22)
+                                                                  ├─▶ 22 consoles
+                                        P3XC REQ/RSP, pooled, concurrent
+```
+
+Run a head server per subcluster from one shared config file:
+
+```bash
+python3 tools/gen_cluster_config.py --layer 3 --experts 44 \
+    --expert-host 10.0.0.10 --head-host 10.0.1.1 -o cluster.json   # 2 × 22
+python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
+python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
+    --check-members                      # PING every console behind this head
+```
+
+The layer coordinator reads the same file and talks only to the heads:
+
+```python
+from ps3_cluster import (ClusterConfig, HierarchicalExpertDispatcher,
+                         SubclusterTransport)
+
+config = ClusterConfig.load("cluster.json")
+transport = SubclusterTransport(config.group_endpoints(), timeout=30.0)
+dispatcher = HierarchicalExpertDispatcher(config.placement(), config.plan(),
+                                          transport)
+y = dispatcher.run_expert_stage(layer, x, expert_ids, gate_weights, token_id)
+alive = dispatcher.check_liveness()
+dispatcher.close(); transport.close()
+```
+
+Properties, all covered by `tests/test_hierarchy.py` over real sockets:
+
+- **One activation per subcluster**, not per expert: a `BREQ` carries the
+  activation once plus 8 bytes per selected expert, so a top-4-in-one-subcluster
+  pick costs ~28 KB instead of ~112 KB at K3 width (fixed big-endian, versioned,
+  every count bounded — see `ps3_cluster/batch.py`).
+- **Concurrent inside and across subclusters**: the head server fans its
+  experts out through the same pooled transport as the flat path, and the layer
+  sends the involved heads' batches together.
+- **Multiple batches per upstream connection**, correlated by
+  `(layer, 0xFFFF, token_id)`, so replies may come back out of order.
+- **All-or-error partials**: a subcluster returns a sum covering *every*
+  requested expert (after any configured replica failover) or a `BERR` naming
+  the failed experts and their consoles, raised as `SubclusterError` with
+  `safe_to_retry` set only when no expert can have run. A short sum is never
+  reduced. Passing `replicas=[...]` pins entries to standby consoles when the
+  layer already knows a primary is down.
+- **Numerics**: contributions are summed in ascending expert order inside a
+  subcluster and partials in ascending group order — bit-identical to the
+  in-process `hierarchical_reduce`, and bit-identical to the flat sum when one
+  subcluster covers the stage. Grouping otherwise re-associates float32
+  additions, so a multi-subcluster result can differ from the flat sum in the
+  last bits.
+- The flat `DistributedExpertDispatcher` and the canonical
+  one-expert-per-layer-per-node placement are unchanged; a head server is an
+  overlay, not a placement authority.
 
 **Heartbeats.** `transport.ping(node)` / `.alive(node)` use the protocol's
 PING/PONG frames on the same connection as expert traffic; both the Python and C

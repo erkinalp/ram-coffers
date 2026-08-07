@@ -95,6 +95,30 @@ class SubclusterPlan:
         return [(g, buckets[g]) for g in sorted(buckets)]
 
     @classmethod
+    def from_groups(cls, groups: Dict[str, Sequence[str]],
+                    size: int = DEFAULT_SUBCLUSTER_SIZE,
+                    prefix: str = "sc") -> "SubclusterPlan":
+        """Build a plan from *declared* membership rather than by position.
+
+        A deployed farm's grouping comes from its config file (which head server
+        fronts which consoles), not from an ordering, so the plan has to be able
+        to take that as given. ``size`` is retained as the declared maximum and
+        oversized groups are rejected.
+        """
+        plan = cls((), size=size, prefix=prefix)
+        for group_id in sorted(groups):
+            members = list(groups[group_id])
+            if len(members) > size:
+                raise ValueError(f"subcluster {group_id} has {len(members)} "
+                                 f"members, over the declared size {size}")
+            for node_id in members:
+                if node_id in plan._of_node:
+                    raise ValueError(f"duplicate node id {node_id!r}")
+                plan._of_node[node_id] = group_id
+            plan._groups[group_id] = members
+        return plan
+
+    @classmethod
     def for_placement(cls, placement, layer: Optional[int] = None,
                       size: int = DEFAULT_SUBCLUSTER_SIZE,
                       prefix: str = "sc") -> "SubclusterPlan":

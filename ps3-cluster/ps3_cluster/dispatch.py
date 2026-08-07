@@ -31,13 +31,15 @@ slots underneath a transformers ``forward`` via the same hook points #316 uses.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import socket
 import threading
 import time
 import numpy as np
 
-from .errors import NodeConnectError, NodeError, TransportError
+from .errors import (NodeConnectError, NodeError, NodeTimeout,
+                     TransportError)
 from .protocol import (encode, decode, MSG_REQ, MSG_RSP, MSG_ERR, ProtocolError,
                        read_frame)
 from .subcluster import SubclusterPlan, hierarchical_reduce
@@ -253,17 +255,21 @@ class DispatchStage:
         """The primary node contacted per top-k position."""
         return list(self._node_ids)
 
-    def result(self, timeout: Optional[float] = None) -> np.ndarray:
-        """Reduce the fan-out once every expert has answered.
+    def gather(self, timeout: Optional[float] = None
+               ) -> Tuple[Dict[int, np.ndarray], Dict[int, BaseException]]:
+        """Await every call, returning contributions and per-position errors.
 
-        Each contribution ``gate_j * y_j`` is scaled on the worker thread as it
-        arrives; the *summation* then happens in a fixed order (ascending top-k
-        position, or subcluster-by-subcluster for a hierarchical plan) so the
-        result is bit-for-bit reproducible and, in the flat case, identical to
-        the old serial implementation.
+        Every sibling call is awaited even after one fails, so no thread or
+        socket is orphaned. The failure map is keyed by top-k position, which is
+        what a subcluster coordinator needs to name the experts it could not
+        deliver (see ``coordinator.py``). A call that outlives the stage deadline
+        is reported as :class:`~.errors.NodeTimeout` against the node it was
+        sent to; the request itself is left to the transport, which retires the
+        correlation key on its own deadline and drops any late response rather
+        than reducing it.
         """
         contributions: Dict[int, np.ndarray] = {}
-        errors: List[BaseException] = []
+        errors: Dict[int, BaseException] = {}
         # One deadline for the whole stage, not per expert.
         deadline = None if timeout is None else time.monotonic() + timeout
         for position, future in sorted(self._futures.items()):
@@ -271,10 +277,18 @@ class DispatchStage:
                 contributions[position] = future.result(
                     None if deadline is None
                     else max(0.0, deadline - time.monotonic()))
-            except BaseException as exc:  # noqa: BLE001 - re-raised below
-                errors.append(exc)
-        if errors:
-            raise errors[0]
+            except FutureTimeout:
+                node = (self._node_ids[position]
+                        if position < len(self._node_ids) else "?")
+                errors[position] = NodeTimeout(
+                    node, f"expert call did not finish within the stage "
+                          f"deadline of {timeout} s")
+            except BaseException as exc:  # noqa: BLE001 - returned to caller
+                errors[position] = exc
+        return contributions, errors
+
+    def reduce(self, contributions: Dict[int, np.ndarray]) -> np.ndarray:
+        """Sum contributions in the stage's fixed order."""
         if not contributions:
             return np.zeros(self._shape, dtype=np.float32)
         if self._plan is not None:
@@ -285,6 +299,20 @@ class DispatchStage:
         for position in ordered[1:]:
             out = out + contributions[position]
         return out
+
+    def result(self, timeout: Optional[float] = None) -> np.ndarray:
+        """Reduce the fan-out once every expert has answered.
+
+        Each contribution ``gate_j * y_j`` is scaled on the worker thread as it
+        arrives; the *summation* then happens in a fixed order (ascending top-k
+        position, or subcluster-by-subcluster for a hierarchical plan) so the
+        result is bit-for-bit reproducible and, in the flat case, identical to
+        the old serial implementation.
+        """
+        contributions, errors = self.gather(timeout)
+        if errors:
+            raise errors[min(errors)]
+        return self.reduce(contributions)
 
 
 class DistributedExpertDispatcher:
@@ -342,14 +370,31 @@ class DistributedExpertDispatcher:
         self.close()
 
     # -- dispatch ----------------------------------------------------------
+    def _candidates(self, layer: int, expert: int,
+                    replica: int = 0) -> List[str]:
+        """Failover order for one expert, optionally pinned to a replica.
+
+        ``replica=0`` is the canonical console; a caller that already knows the
+        primary is down (a subcluster batch may carry that hint per entry) can
+        start further along the list instead of paying the failed attempt again.
+        """
+        candidates = (self.placement.nodes_for(layer, expert)
+                      if self.retry_policy.use_replicas
+                      else [self.placement.node_for(layer, expert)])
+        if replica:
+            if replica >= len(candidates):
+                raise ValueError(
+                    f"expert {expert} on layer {layer} has no replica "
+                    f"{replica} ({len(candidates) - 1} configured)")
+            candidates = candidates[replica:]
+        return candidates
+
     def _call_expert(self, layer: int, expert: int, token_id: int,
                      x: np.ndarray, gate: float,
-                     trail: List[str]) -> np.ndarray:
+                     trail: List[str], replica: int = 0) -> np.ndarray:
         """One expert call with the retry/failover policy applied."""
         policy = self.retry_policy
-        candidates = (self.placement.nodes_for(layer, expert)
-                      if policy.use_replicas
-                      else [self.placement.node_for(layer, expert)])
+        candidates = self._candidates(layer, expert, replica)
         last: Optional[BaseException] = None
         for attempt in range(policy.attempts):
             node = candidates[min(attempt, len(candidates) - 1)]
@@ -367,16 +412,25 @@ class DistributedExpertDispatcher:
     def submit_expert_stage(self, layer: int, x: np.ndarray,
                             expert_ids: Sequence[int],
                             gate_weights: Sequence[float],
-                            token_id: int = 0) -> DispatchStage:
+                            token_id: int = 0,
+                            replicas: Optional[Sequence[int]] = None
+                            ) -> DispatchStage:
         """Fan out the top-k calls and return without waiting for them.
 
         The optional asynchronous API: callers that overlap layers or batch
         tokens can hold several stages in flight. ``DispatchStage.result()``
-        performs the reduction.
+        performs the reduction. ``replicas`` optionally pins each position to a
+        standby console (0 = the canonical one), which is how a subcluster batch
+        forwards the replica hint its entries carry.
         """
         if len(expert_ids) != len(gate_weights):
             raise ValueError("expert_ids and gate_weights length mismatch")
-        node_ids = [self.placement.node_for(layer, e) for e in expert_ids]
+        if replicas is not None and len(replicas) != len(expert_ids):
+            raise ValueError("expert_ids and replicas length mismatch")
+        hints = ([0] * len(expert_ids) if replicas is None
+                 else [int(r) for r in replicas])
+        node_ids = [self._candidates(layer, int(e), r)[0]
+                    for e, r in zip(expert_ids, hints)]
         attempts: Dict[int, List[str]] = {}
         futures = {}
         if expert_ids:
@@ -387,7 +441,7 @@ class DistributedExpertDispatcher:
                 attempts[position] = trail
                 futures[position] = executor.submit(
                     self._call_expert, layer, int(expert), token_id, x,
-                    float(gate), trail)
+                    float(gate), trail, hints[position])
         return DispatchStage(futures, node_ids, self.subclusters, x.shape,
                              attempts)
 
