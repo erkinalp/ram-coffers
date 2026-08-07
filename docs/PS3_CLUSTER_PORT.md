@@ -68,7 +68,10 @@ ps3-cluster/
     p3xc.h                 wire protocol in C (byte-identical to protocol.py)
     mxfp4.h                MXFP4 (microscaling FP4) dequant + dot, shared PPE/SPU/host
   spu/expert_spu.c         SPE kernel: DMA-streamed MXFP4 GEMV slice
-  ppu/expert_ppu.c         PPE driver: resident expert + libspe2 fan-out + TCP worker
+  ppu/expert_ppu.c         PPE driver: resident expert + backend select + TCP worker
+  rsx/expert_rsx.cg        RSX Cg fragment shader: MXFP4 GEMV, one row/fragment
+  rsx/expert_rsx.c         RSX host driver (PSGL/Cg), USE_RSX-guarded
+  rsx/rsx_gemv_emu.h       CPU model of the shader math, for host testing
   ps3_cluster/
     protocol.py            length-prefixed big-endian frame codec
     topology.py            1-expert-1-layer/node planner + Kimi K3 profile
@@ -94,6 +97,34 @@ ps3-cluster/
    store. It replies with a `RSP` frame.
 4. The dispatcher combines the top-k outputs with the gate weights:
    `y = Σ gate_j · expert_j(x)`.
+
+## Compute backends
+
+`expert_ppu.c` selects the GEMV backend at compile time (all share one ABI, so
+the coordinator can't tell them apart):
+
+| Backend | Macro | Where it runs | Build |
+|---------|-------|---------------|-------|
+| Scalar PPE | *(default)* | any CPU (host-sim, or PPE fallback) | `make host` → `expert_node_host` |
+| Cell SPEs | `USE_SPE` (auto on `__PPU__` + `HAVE_LIBSPE2`) | 6 SPEs via libspe2, DMA-streamed MXFP4 tiles | `make ps3` |
+| RSX GPU | `USE_RSX` | RSX fragment shader via PSGL/Cg (GameOS exploit) | `make ps3-rsx` |
+| RSX shader model | `GEMV_RSX_EMU` | CPU model of the shader, for testing | `make host` → `expert_node_rsxemu` |
+
+**RSX shader path.** `rsx/expert_rsx.cg` computes one output row per fragment:
+the MXFP4-packed weights are an R8 texture (`row_bytes × rows`), the activation
+an R32F texture, and the 16-entry E2M1 table a 16×1 LUT texture; the shader
+unpacks nibbles, applies the E8M0 `exp2` block scale, multiplies by the input
+texels, accumulates, and writes to a `1 × rows` fp32 render target that the host
+reads back. This targets the GameOS-exploit boot where the RSX (NV47/G70-class,
+SM3.0, fp32 fragments) is fully programmable; it is an alternative to the SPE
+backend, not a replacement — a node can use whichever engine is available.
+
+Because there is no RSX toolchain or GPU in CI, `rsx/rsx_gemv_emu.h` reproduces
+the shader's exact per-fragment math (byte normalise/recover, LUT lookup,
+`exp2` scale, nibble unpack) on the CPU, and `tests/test_rsx_kernel.py` checks
+that the emulated shader output matches the numpy reference end to end. A full K3
+row (n=7168 → 224 blocks) is a long SM3.0 loop and may need column-tiling into
+multiple passes on real hardware; the host driver is structured to allow that.
 
 ## Cell / OtherOS constraints (see `cell-compat.h`)
 
@@ -141,8 +172,12 @@ cannot tell a simulated node from a real console.
 ## Status
 
 MVP. The dispatch layer, wire protocol, MXFP4 kernel, SwiGLU FFN, topology
-planner, and host-sim worker are implemented and tested end to end. Not yet
-done: a coordinator shim that hangs `DistributedExpertDispatcher` off a real
-transformers `forward` via #316's hook points (documented in
-`ps3-cluster/README.md`), AltiVec-vectorised SPU dequant, and validation on
-physical PS3 hardware.
+planner, host-sim worker, SPE kernel, and RSX shader backend (with a
+CPU-validated shader model) are implemented; the numeric path is tested end to
+end against a numpy reference. Not yet done: a coordinator shim that hangs
+`DistributedExpertDispatcher` off a real transformers `forward` via #316's hook
+points (documented in `ps3-cluster/README.md`), AltiVec-vectorised SPU dequant,
+column-tiling the RSX shader for full-width K3 rows, and validation on physical
+PS3 hardware (both the SPE and RSX paths compile only against their toolchains,
+which aren't present in CI, so they are checked by syntax/stub compilation plus
+the CPU shader model).

@@ -39,6 +39,17 @@
 extern spe_program_handle_t expert_spu;   /* embedded SPU image */
 #endif
 
+/* Compute backend selection (mutually exclusive; scalar is the default):
+ *   USE_SPE        - real Cell SPEs via libspe2 (set on __PPU__ + HAVE_LIBSPE2)
+ *   USE_RSX        - real RSX GPU shader (GameOS-exploit path, PSGL/Cg)
+ *   GEMV_RSX_EMU   - CPU model of the RSX shader (host testing only)
+ * USE_RSX/GEMV_RSX_EMU take precedence over USE_SPE when explicitly requested. */
+#if defined(USE_RSX)
+void gemv_rsx(const uint8_t *, const float *, float *, uint32_t, uint32_t);
+#elif defined(GEMV_RSX_EMU)
+#include "../rsx/rsx_gemv_emu.h"
+#endif
+
 typedef struct {
     uint32_t hidden, inter;
     uint16_t layer, expert;
@@ -139,7 +150,11 @@ static void gemv_spe(const uint8_t *W, const float *x, float *out,
 /* GEMV: out[r] = dot(W[r], x), r in [0,rows). n = input dim. */
 static void gemv(const uint8_t *W, const float *x, float *out,
                  uint32_t rows, uint32_t n) {
-#ifdef USE_SPE
+#if defined(USE_RSX)
+    gemv_rsx(W, x, out, rows, n);
+#elif defined(GEMV_RSX_EMU)
+    rsx_emu_gemv(W, x, out, rows, n);
+#elif defined(USE_SPE)
     gemv_spe(W, x, out, rows, n);
 #else
     size_t row_bytes = (size_t)(n / MXFP4_BLOCK) * MXFP4_BYTES_PER_BLOCK;

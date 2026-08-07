@@ -28,6 +28,11 @@ python3 tools/plan_k3.py                     # size the cluster for Kimi K3
   DMA-streamed weight tiles; `expert_ppu.c` is the PPE driver that keeps one
   expert resident, fans each matmul across the SPEs via libspe2, and serves the
   P3XC protocol over TCP.
+- **RSX GPU backend** (`rsx/`): an alternative to the SPE path for the
+  GameOS-exploit boot. `expert_rsx.cg` is a Cg fragment shader doing the MXFP4
+  GEMV on the RSX; `expert_rsx.c` is the PSGL/Cg host driver; `rsx_gemv_emu.h`
+  is a CPU model of the shader used to validate it on x86. Select with `USE_RSX`
+  (real) or `GEMV_RSX_EMU` (emulated); see `../docs/PS3_CLUSTER_PORT.md`.
 - **`cell-compat.h`**: the PS3 analogue of `power8-compat.h` — big-endian ppc64,
   classic AltiVec only (no VSX/MMA), SPE local-store budget.
 
