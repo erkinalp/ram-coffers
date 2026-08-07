@@ -1,4 +1,11 @@
-"""Subcluster coordinator: a real head-server process for 22 consoles.
+"""Coordinator processes: the head server for 22 consoles, and its base class.
+
+The base class is the reusable half. A coordinator is anything that accepts a
+batched BREQ, drives *something* below it, and answers with either every
+requested contribution or a structured BERR; whether "below" means consoles
+(:class:`SubclusterCoordinator`, here) or more coordinators
+(:class:`~.regional.RegionalCoordinator`) is the only difference, so the tier
+count is a deployment choice rather than a protocol one.
 
 Condor, the 1,716-console AFRL PS3 cluster, was wired as **subclusters of 22
 PlayStation 3s behind a coordinating server**, and the heads aggregated results
@@ -57,7 +64,7 @@ from __future__ import annotations
 import socketserver
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -66,6 +73,7 @@ from .batch import (ERR_NODE_DISCONNECTED, ERR_NODE_ERROR, ERR_NODE_TIMEOUT,
                     ERR_UNKNOWN_EXPERT, ERR_BAD_REQUEST, BatchFailure,
                     encode_batch_contributions, encode_batch_error,
                     encode_batch_response, parse_batch_request)
+from .dedup import DedupCache
 from .dispatch import (DistributedExpertDispatcher, ExpertPlacement,
                        RetryPolicy)
 from .errors import (NodeConnectError, NodeDisconnected, NodeError,
@@ -96,7 +104,104 @@ def failure_reason(exc: BaseException) -> int:
     return ERR_UNKNOWN
 
 
-class SubclusterCoordinator:
+class BaseCoordinator:
+    """The part of a coordinator that does not depend on what is below it.
+
+    Owns the checks every tier owes its caller — am I shutting down, do I hold
+    these experts, may I answer a fast request, how long have I got — and the
+    dedup cache that makes a retried batch execute once per process. Subclasses
+    implement :meth:`owns` and :meth:`_serve_batch`.
+    """
+
+    def __init__(self, group_id: str, timeout: float = DEFAULT_TIMEOUT,
+                 allow_fast: bool = True,
+                 dedup: Optional[DedupCache] = None) -> None:
+        self.group_id = group_id
+        self.timeout = timeout
+        self.allow_fast = allow_fast
+        #: Bounded request-id cache; ``None`` disables replay entirely.
+        self.dedup = DedupCache() if dedup is None else dedup
+        self._lock = threading.Lock()
+        self._closed = False
+        #: Observability, asserted by the tests.
+        self.batches_served = 0
+        self.experts_called = 0
+        self.fast_batches = 0
+
+    # -- to implement ------------------------------------------------------
+    def owns(self, layer: int, expert: int) -> bool:
+        raise NotImplementedError
+
+    def _serve_batch(self, msg: dict, timeout: float) -> bytes:
+        raise NotImplementedError
+
+    def _close(self) -> None:
+        raise NotImplementedError
+
+    # -- batch handling ----------------------------------------------------
+    def handle_batch(self, msg: dict) -> bytes:
+        """Run one decoded BREQ and return the BRSP (or BERR) frame to send.
+
+        A batch that names a ``request_id`` runs under the dedup cache: a retry
+        of the same logical batch (a reconnect, or the caller reaching this
+        process through another of its endpoints) replays the first attempt's
+        frame instead of fanning out again. A retry that lands on a *different*
+        process cannot be recognised and is at-least-once execution; the caller
+        still reduces exactly one answer.
+        """
+        layer = msg["layer"]
+        token_id = msg["token_id"]
+        request_id = msg.get("request_id")
+        entries = msg["entries"]
+        if self._closed:
+            return encode_batch_error(layer, token_id, ERR_SHUTTING_DOWN,
+                                      detail=f"{self.group_id} is shutting "
+                                             f"down",
+                                      request_id=request_id)
+        missing = [e for e in entries if not self.owns(layer, e.expert)]
+        if missing:
+            return encode_batch_error(
+                layer, token_id, ERR_UNKNOWN_EXPERT,
+                [BatchFailure(e.expert, ERR_UNKNOWN_EXPERT, self.group_id)
+                 for e in missing],
+                f"{self.group_id} does not hold "
+                f"{len(missing)} of {len(entries)} requested experts",
+                request_id=request_id)
+        if msg.get("fast") and not self.allow_fast:
+            return encode_batch_error(
+                layer, token_id, ERR_BAD_REQUEST,
+                detail=f"{self.group_id} does not serve fast "
+                       f"(partial-sum) batches",
+                request_id=request_id)
+        timeout = self.timeout
+        if msg.get("deadline_ms"):
+            timeout = min(timeout, msg["deadline_ms"] / 1000.0)
+        try:
+            return self.dedup.run(request_id,
+                                  lambda: self._serve_batch(msg, timeout),
+                                  timeout=timeout)
+        except TimeoutError as exc:
+            return encode_batch_error(layer, token_id, ERR_NODE_TIMEOUT,
+                                      detail=str(exc)[:400],
+                                      request_id=request_id)
+
+    def _count(self, entries: Sequence[object], fast: bool) -> None:
+        with self._lock:
+            self.batches_served += 1
+            self.experts_called += len(entries)
+            if fast:
+                self.fast_batches += 1
+
+    # -- teardown ----------------------------------------------------------
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._close()
+
+
+class SubclusterCoordinator(BaseCoordinator):
     """Fans a batch out to this subcluster's consoles and answers upstream.
 
     Parameters
@@ -124,23 +229,17 @@ class SubclusterCoordinator:
                  max_workers: Optional[int] = None,
                  retry_policy: Optional[RetryPolicy] = None,
                  transport: Optional[PersistentSocketTransport] = None,
-                 allow_fast: bool = True):
-        self.group_id = group_id
+                 allow_fast: bool = True,
+                 dedup: Optional[DedupCache] = None):
+        super().__init__(group_id, timeout=timeout, allow_fast=allow_fast,
+                         dedup=dedup)
         self.placement = placement
-        self.timeout = timeout
-        self.allow_fast = allow_fast
         self._owns_transport = transport is None
         self.transport = (PersistentSocketTransport(endpoints, timeout=timeout)
                           if transport is None else transport)
         self.dispatcher = DistributedExpertDispatcher(
             placement, self.transport, max_workers=max_workers,
             retry_policy=retry_policy)
-        self._lock = threading.Lock()
-        self._closed = False
-        #: Observability, asserted by the tests.
-        self.batches_served = 0
-        self.experts_called = 0
-        self.fast_batches = 0
 
     # -- membership --------------------------------------------------------
     def member_nodes(self, layer: Optional[int] = None) -> List[str]:
@@ -159,32 +258,13 @@ class SubclusterCoordinator:
         return self.dispatcher.check_liveness(self.member_nodes(layer), timeout)
 
     # -- batch handling ----------------------------------------------------
-    def handle_batch(self, msg: dict) -> bytes:
-        """Run one decoded BREQ and return the BRSP (or BERR) frame to send."""
+    def _serve_batch(self, msg: dict, timeout: float) -> bytes:
+        """Fan one batch out to the consoles and encode the answer."""
         layer = msg["layer"]
         token_id = msg["token_id"]
+        request_id = msg.get("request_id")
         entries = msg["entries"]
-        if self._closed:
-            return encode_batch_error(layer, token_id, ERR_SHUTTING_DOWN,
-                                      detail=f"{self.group_id} is shutting down")
-        missing = [e for e in entries if not self.owns(layer, e.expert)]
-        if missing:
-            return encode_batch_error(
-                layer, token_id, ERR_UNKNOWN_EXPERT,
-                [BatchFailure(e.expert, ERR_UNKNOWN_EXPERT, self.group_id)
-                 for e in missing],
-                f"{self.group_id} does not hold "
-                f"{len(missing)} of {len(entries)} requested experts")
-
         fast = bool(msg.get("fast"))
-        if fast and not self.allow_fast:
-            return encode_batch_error(
-                layer, token_id, ERR_BAD_REQUEST,
-                detail=f"{self.group_id} does not serve fast "
-                       f"(partial-sum) batches")
-        timeout = self.timeout
-        if msg.get("deadline_ms"):
-            timeout = min(timeout, msg["deadline_ms"] / 1000.0)
         try:
             # A non-zero replica hint pins that entry to a standby console; an
             # unconfigured hint is a request error, not a node failure.
@@ -196,13 +276,10 @@ class SubclusterCoordinator:
             return encode_batch_error(
                 layer, token_id, ERR_BAD_REQUEST,
                 [BatchFailure(e.expert, ERR_BAD_REQUEST, self.group_id)
-                 for e in entries if e.replica], str(exc)[:400])
+                 for e in entries if e.replica], str(exc)[:400],
+                request_id=request_id)
         contributions, errors = stage.gather(timeout)
-        with self._lock:
-            self.batches_served += 1
-            self.experts_called += len(entries)
-            if fast:
-                self.fast_batches += 1
+        self._count(entries, fast)
         if errors:
             failures = []
             for position in sorted(errors):
@@ -212,24 +289,21 @@ class SubclusterCoordinator:
                                              trail[-1]))
             return encode_batch_error(layer, token_id, failures[0].reason,
                                       failures,
-                                      str(errors[min(errors)])[:400])
+                                      str(errors[min(errors)])[:400],
+                                      request_id=request_id)
         if fast:
             return encode_batch_response(layer, token_id,
                                          stage.reduce(contributions),
-                                         len(entries))
+                                         len(entries), request_id=request_id)
         # Exact mode: hand the weighted contributions up untouched, tagged with
         # their experts, and let the layer sum them in its own top-k order.
         positions = sorted(contributions)
         return encode_batch_contributions(
             layer, token_id, [contributions[p] for p in positions],
-            [entries[p].expert for p in positions])
+            [entries[p].expert for p in positions], request_id=request_id)
 
     # -- teardown ----------------------------------------------------------
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
+    def _close(self) -> None:
         self.dispatcher.close()
         if self._owns_transport:
             self.transport.close()
@@ -246,7 +320,7 @@ class _UpstreamHandler(socketserver.BaseRequestHandler):
     """
 
     def handle(self) -> None:
-        server: "SubclusterServer" = self.server  # type: ignore[assignment]
+        server: "CoordinatorServer" = self.server  # type: ignore[assignment]
         send_lock = threading.Lock()
         inflight: List[object] = []
         while True:
@@ -282,12 +356,13 @@ class _UpstreamHandler(socketserver.BaseRequestHandler):
             future.exception()  # never leave a batch running past the socket
 
     def _run(self, send_lock: threading.Lock, request: dict) -> None:
-        server: "SubclusterServer" = self.server  # type: ignore[assignment]
+        server: "CoordinatorServer" = self.server  # type: ignore[assignment]
         try:
             frame = server.coordinator.handle_batch(request)
         except Exception as exc:  # noqa: BLE001 - must answer, never hang
             frame = encode_batch_error(request["layer"], request["token_id"],
-                                       ERR_UNKNOWN, detail=repr(exc)[:400])
+                                       ERR_UNKNOWN, detail=repr(exc)[:400],
+                                       request_id=request.get("request_id"))
         self._send(send_lock, frame)
 
     def _send(self, send_lock: threading.Lock, frame: bytes) -> None:
@@ -298,12 +373,14 @@ class _UpstreamHandler(socketserver.BaseRequestHandler):
                 pass  # peer went away; the read loop will notice
 
 
-class SubclusterServer(socketserver.ThreadingTCPServer):
+class CoordinatorServer(socketserver.ThreadingTCPServer):
+    """Serves BREQ frames for any coordinator, subcluster or regional."""
+
     allow_reuse_address = True
     daemon_threads = True
 
     def __init__(self, host: str, port: int,
-                 coordinator: SubclusterCoordinator,
+                 coordinator: BaseCoordinator,
                  upstream_workers: int = DEFAULT_UPSTREAM_WORKERS):
         super().__init__((host, port), _UpstreamHandler)
         self.coordinator = coordinator
@@ -316,19 +393,21 @@ class SubclusterServer(socketserver.ThreadingTCPServer):
         self.upstream_pool.shutdown(wait=True)
 
 
-class SubclusterService:
-    """A ``SubclusterCoordinator`` running in its own thread on a real socket.
+class CoordinatorService:
+    """A coordinator running in its own thread on a real socket.
 
-    The deployable unit: ``run_subcluster.py`` starts one per head server, and
-    the tests start several in-process on loopback.
+    The deployable unit: ``run_subcluster.py`` and ``run_region.py`` start one
+    per head server, and the tests start several in-process on loopback. Two
+    services may share one coordinator, which is how a head server offers a
+    primary and a standby address without duplicating its dedup state.
     """
 
-    def __init__(self, coordinator: SubclusterCoordinator,
+    def __init__(self, coordinator: BaseCoordinator,
                  host: str = "127.0.0.1", port: int = 0,
                  upstream_workers: int = DEFAULT_UPSTREAM_WORKERS):
         self.coordinator = coordinator
-        self.server = SubclusterServer(host, port, coordinator,
-                                       upstream_workers=upstream_workers)
+        self.server = CoordinatorServer(host, port, coordinator,
+                                        upstream_workers=upstream_workers)
         self._thread = threading.Thread(
             target=self.server.serve_forever,
             name=f"p3xc-sc-accept-{coordinator.group_id}", daemon=True)
@@ -341,22 +420,40 @@ class SubclusterService:
     def address(self) -> Tuple[str, int]:
         return self.server.server_address[:2]
 
-    def start(self) -> "SubclusterService":
+    def start(self) -> "CoordinatorService":
         self._thread.start()
         return self
 
-    def stop(self) -> None:
-        """Stop accepting, drain in-flight batches, release every socket."""
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def stop(self, close_coordinator: bool = True) -> None:
+        """Stop accepting, drain in-flight batches, release every socket.
+
+        ``close_coordinator=False`` gives up only this listener, which is what a
+        head server's second (standby) address needs: the coordinator behind it
+        keeps serving the primary address.
+        """
+        self.stop_listening()
+        if close_coordinator:
+            self.coordinator.close()
+
+    def stop_listening(self) -> None:
+        """Release this socket, leaving the coordinator itself usable."""
         self.server.shutdown()
         self.server.server_close()
         self._thread.join(timeout=5.0)
-        self.coordinator.close()
 
-    def __enter__(self) -> "SubclusterService":
+    def __enter__(self) -> "CoordinatorService":
         return self.start()
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+#: Phase-2 names, kept so existing deployments and tests still import them.
+SubclusterServer = CoordinatorServer
+SubclusterService = CoordinatorService
 
 
 def serve_subcluster(group_id: str, placement: ExpertPlacement,
@@ -364,10 +461,11 @@ def serve_subcluster(group_id: str, placement: ExpertPlacement,
                      host: str = "0.0.0.0", port: int = 0,
                      timeout: float = DEFAULT_TIMEOUT,
                      retry_policy: Optional[RetryPolicy] = None,
-                     allow_fast: bool = True) -> SubclusterService:
+                     allow_fast: bool = True,
+                     dedup: Optional[DedupCache] = None) -> CoordinatorService:
     """Build (but do not start) a subcluster service."""
     coordinator = SubclusterCoordinator(group_id, placement, endpoints,
                                         timeout=timeout,
                                         retry_policy=retry_policy,
-                                        allow_fast=allow_fast)
-    return SubclusterService(coordinator, host=host, port=port)
+                                        allow_fast=allow_fast, dedup=dedup)
+    return CoordinatorService(coordinator, host=host, port=port)

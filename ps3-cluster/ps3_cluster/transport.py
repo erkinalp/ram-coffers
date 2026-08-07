@@ -38,6 +38,18 @@ Design
   socket: it caps the number of correlation-key collisions that must serialise,
   and lets the C worker — which processes requests sequentially on a connection
   (see ``ppu/expert_ppu.c``) — still be driven concurrently.
+* A logical peer may have **several endpoints**, given in preference order:
+  ``{"sc-0000": [("head-a", 8100), ("head-b", 8100)]}``. Opening a connection
+  walks the list and stops at the first endpoint that accepts, so a dead primary
+  costs one refused connect rather than the request. A failed connect (or an
+  explicit :meth:`PersistentSocketTransport.mark_endpoint_dead` after a heartbeat
+  failure) puts that endpoint in a short cooldown, which only reorders
+  preference: every endpoint is still tried before the transport gives up, so
+  correctness never depends on the health state being accurate. Consoles are
+  configured the same way, but their standby copies stay modelled as replica
+  *nodes* in ``ExpertPlacement`` — an expert's weights live on a particular
+  console, so failing over to another console is a placement decision rather
+  than a connection detail.
 
 Failure semantics are documented in ``docs/PS3_CLUSTER_PORT.md``; briefly, a
 timeout permanently retires that correlation key on that connection (so a late
@@ -54,7 +66,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -66,10 +78,26 @@ from .protocol import (MSG_ERR, MSG_PING, MSG_PONG, MSG_REQ, MSG_RSP,
                        ProtocolError, decode, encode)
 
 Endpoint = Tuple[str, int]
+#: One endpoint, or an ordered primary-first list of them, for one logical peer.
+EndpointSpec = Union[Endpoint, Sequence[Endpoint]]
 CorrelationKey = Tuple[int, int, int]
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_POOL_SIZE = 4
+
+#: How long a failed endpoint is deprioritised. Only affects preference order.
+DEFAULT_ENDPOINT_COOLDOWN = 5.0
+
+
+def _as_endpoints(spec: EndpointSpec) -> List[Endpoint]:
+    """Normalise ``(host, port)`` or a list of them into a preference list."""
+    if (isinstance(spec, tuple) and len(spec) == 2
+            and isinstance(spec[0], str) and isinstance(spec[1], int)):
+        return [spec]
+    endpoints = [(str(host), int(port)) for host, port in spec]
+    if not endpoints:
+        raise ValueError("a peer needs at least one endpoint")
+    return endpoints
 
 
 class _Pending:
@@ -279,13 +307,17 @@ class PersistentSocketTransport(Transport):
         Bound on the per-node connection pool.
     """
 
-    def __init__(self, endpoints: Dict[str, Endpoint],
+    def __init__(self, endpoints: Dict[str, EndpointSpec],
                  timeout: float = DEFAULT_TIMEOUT,
                  connect_timeout: Optional[float] = None,
-                 max_connections_per_node: int = DEFAULT_POOL_SIZE):
+                 max_connections_per_node: int = DEFAULT_POOL_SIZE,
+                 endpoint_cooldown: float = DEFAULT_ENDPOINT_COOLDOWN):
         if max_connections_per_node < 1:
             raise ValueError("max_connections_per_node must be >= 1")
-        self._endpoints = dict(endpoints)
+        self._endpoints = {node: _as_endpoints(spec)
+                           for node, spec in endpoints.items()}
+        self._cooldown = endpoint_cooldown
+        self._dead_until: Dict[Tuple[str, Endpoint], float] = {}
         self._timeout = timeout
         self._connect_timeout = (timeout if connect_timeout is None
                                  else connect_timeout)
@@ -296,30 +328,76 @@ class PersistentSocketTransport(Transport):
         self._ping_ids = itertools.count(1)
         # Observability, used by the tests to prove connection reuse.
         self.connects_opened: Dict[str, int] = {}
+        self.connects_by_endpoint: Dict[Tuple[str, Endpoint], int] = {}
         self.requests_sent: Dict[str, int] = {}
 
     # -- endpoints --------------------------------------------------------
-    def add_endpoint(self, node_id: str, endpoint: Endpoint) -> None:
+    def add_endpoint(self, node_id: str, endpoint: EndpointSpec) -> None:
+        """Register one endpoint, or an ordered primary-first list of them."""
         with self._lock:
-            self._endpoints[node_id] = endpoint
+            self._endpoints[node_id] = _as_endpoints(endpoint)
 
-    def endpoint_for(self, node_id: str) -> Endpoint:
+    def endpoints_for(self, node_id: str) -> List[Endpoint]:
+        """Every endpoint for a peer, in configured (preference) order."""
         try:
-            return self._endpoints[node_id]
+            return list(self._endpoints[node_id])
         except KeyError:
             raise NodeConnectError(node_id, "no endpoint configured") from None
+
+    def endpoint_for(self, node_id: str) -> Endpoint:
+        """The endpoint a new connection would prefer right now."""
+        return self._preferred(node_id)[0]
+
+    def _preferred(self, node_id: str) -> List[Endpoint]:
+        """Endpoints with cooled-down ones moved to the back, order kept."""
+        endpoints = self.endpoints_for(node_id)
+        now = time.monotonic()
+        with self._lock:
+            healthy = [e for e in endpoints
+                       if self._dead_until.get((node_id, e), 0.0) <= now]
+        if not healthy or len(healthy) == len(endpoints):
+            return endpoints
+        return healthy + [e for e in endpoints if e not in healthy]
+
+    def mark_endpoint_dead(self, node_id: str, endpoint: Endpoint,
+                           cooldown: Optional[float] = None) -> None:
+        """Deprioritise ``endpoint`` for a while (heartbeat/failover hook).
+
+        Only preference is affected: no request fails because an endpoint is
+        marked dead, and a marked endpoint is still tried once every other
+        endpoint has refused.
+        """
+        with self._lock:
+            self._dead_until[(node_id, endpoint)] = (
+                time.monotonic() + (self._cooldown if cooldown is None
+                                    else cooldown))
+
+    def mark_endpoint_live(self, node_id: str, endpoint: Endpoint) -> None:
+        with self._lock:
+            self._dead_until.pop((node_id, endpoint), None)
+
+    def endpoint_healthy(self, node_id: str, endpoint: Endpoint) -> bool:
+        with self._lock:
+            return self._dead_until.get((node_id, endpoint),
+                                        0.0) <= time.monotonic()
 
     # -- pool -------------------------------------------------------------
     def _acquire(self, node_id: str, key: CorrelationKey) -> _Connection:
         """Pick (or open) a connection with ``key`` not already in flight."""
-        endpoint = self.endpoint_for(node_id)
+        endpoints = self._preferred(node_id)
         with self._lock:
             if self._closed:
                 raise TransportClosed(node_id, "transport closed")
             pool = self._pools.setdefault(node_id, [])
             pool[:] = [c for c in pool if not c.closed]
             free = [c for c in pool if not c.holds_key(key)]
-            idle = [c for c in free if c.in_flight == 0]
+            # Prefer a socket to an endpoint that is not in cooldown; a socket to
+            # a suspect endpoint is still usable, just not first choice.
+            now = time.monotonic()
+            healthy = [c for c in free
+                       if self._dead_until.get((node_id, c.endpoint),
+                                               0.0) <= now]
+            idle = [c for c in (healthy or free) if c.in_flight == 0]
             if idle:
                 return idle[0]
             if len(pool) >= self._pool_size:
@@ -329,18 +407,38 @@ class PersistentSocketTransport(Transport):
                         f"correlation key {key} in flight on every pooled "
                         f"connection ({self._pool_size})")
                 # At the pool bound: multiplex onto the least-loaded socket.
-                return min(free, key=lambda c: c.in_flight)
+                return min(healthy or free, key=lambda c: c.in_flight)
             # Otherwise grow the pool rather than queue behind a busy socket: a
             # worker answers one request at a time per connection, threading
             # only across connections (see ppu/expert_ppu.c, node.py).
-        conn = _Connection(node_id, endpoint, self._connect_timeout)
+        conn = self._connect(node_id, endpoints)
         with self._lock:
             if self._closed:
                 conn.close()
                 raise TransportClosed(node_id, "transport closed")
             self._pools.setdefault(node_id, []).append(conn)
-            self.connects_opened[node_id] = self.connects_opened.get(node_id, 0) + 1
+            self.connects_opened[node_id] = (
+                self.connects_opened.get(node_id, 0) + 1)
+            slot = (node_id, conn.endpoint)
+            self.connects_by_endpoint[slot] = (
+                self.connects_by_endpoint.get(slot, 0) + 1)
         return conn
+
+    def _connect(self, node_id: str,
+                 endpoints: Sequence[Endpoint]) -> _Connection:
+        """Open a socket to the first endpoint that accepts one."""
+        failures: List[str] = []
+        for endpoint in endpoints:
+            try:
+                conn = _Connection(node_id, endpoint, self._connect_timeout)
+            except NodeConnectError as exc:
+                self.mark_endpoint_dead(node_id, endpoint)
+                failures.append(str(exc))
+                continue
+            self.mark_endpoint_live(node_id, endpoint)
+            return conn
+        raise NodeConnectError(node_id, "; ".join(failures)
+                               or "no endpoint configured")
 
     def connection_count(self, node_id: Optional[str] = None) -> int:
         """Live connections, for one node or the whole transport."""
@@ -400,11 +498,18 @@ class PersistentSocketTransport(Transport):
         frame = encode(MSG_PING, 0xFFFF, 0xFFFF, token_id,
                        np.zeros(1, np.float32))
         started = time.monotonic()
-        msg = self.submit_raw(node_id, key, frame,
-                              count=False).message(deadline)
+        handle = self.submit_raw(node_id, key, frame, count=False)
+        try:
+            msg = handle.message(deadline)
+        except TransportError:
+            # A peer that accepts connections but does not answer is worse than
+            # one that refuses: steer new requests at the next endpoint.
+            self.mark_endpoint_dead(node_id, handle.endpoint)
+            raise
         if msg["msg_type"] != MSG_PONG:
             raise NodeError(node_id, msg["layer"], msg["expert"],
                             msg["token_id"])
+        self.mark_endpoint_live(node_id, handle.endpoint)
         return time.monotonic() - started
 
     def alive(self, node_id: str, timeout: Optional[float] = None) -> bool:
@@ -447,6 +552,11 @@ class PendingFrame:
     @property
     def key(self) -> CorrelationKey:
         return self._pending.key
+
+    @property
+    def endpoint(self) -> Endpoint:
+        """Which endpoint of the peer this frame went to."""
+        return self._conn.endpoint
 
     def done(self) -> bool:
         return self._pending.event.is_set()

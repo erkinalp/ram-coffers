@@ -510,7 +510,7 @@ class TestMalformedFrames(unittest.TestCase):
             body = B.encode_batch_request(
                 LAYER, 5, x, [B.BatchEntry(0, 0.5)])[4:]
             head = len(body) - 8 - 8
-            forged = (body[:head] + struct.pack("!HHI", 1, 0x0002, 0)
+            forged = (body[:head] + struct.pack("!HHI", 1, 0x0004, 0)
                       + body[head + 8:])
             frame = struct.pack("!I", len(forged)) + forged
             sock, msg = self._talk(farm.services[0].address, frame)

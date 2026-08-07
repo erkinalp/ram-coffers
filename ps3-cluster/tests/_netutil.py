@@ -348,6 +348,11 @@ def _recv_exact(conn, n):
     return buf
 
 
+def free_port():
+    """A port nothing is listening on, for a process we are about to start."""
+    return dead_endpoint()[1]
+
+
 def dead_endpoint():
     """An address with nothing listening (bound then closed)."""
     s = socket.socket()

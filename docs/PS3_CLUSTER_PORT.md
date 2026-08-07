@@ -222,10 +222,10 @@ length prefixing is unchanged:
 
 | Type | Value | Body |
 |---|---|---|
-| `BREQ` | 6 | header (`expert=0xFFFF`) + activation + `n_entries:u16`, `flags:u16` (`0x0001` = `REQ_FLAG_FAST`, others rejected), `deadline_ms:u32`, then `n_entries × {expert:u16, replica:u8, reserved:u8, gate:f32}` |
-| `BRSP` (exact, default) | 7 | header + `n_reduced` stacked `gate_j*y_j` rows + `n_reduced:u16`, `flags:u16` = `0x0001` (`RSP_FLAG_PER_EXPERT`), then `n_reduced × expert:u16` tags in row order |
-| `BRSP` (fast, opt-in) | 7 | header + one partial sum + `n_reduced:u16`, `flags:u16` = 0 |
-| `BERR` | 8 | header + `[0.0]` + `code:u16`, `n_failures:u16`, then `n_failures × {expert:u16, reason:u16, node_len:u16, node bytes}`, then `detail_len:u16` + UTF-8 detail |
+| `BREQ` | 6 | header (`expert=0xFFFF`) + activation + `n_entries:u16`, `flags:u16` (`0x0001` = `REQ_FLAG_FAST`, `0x0002` = `REQ_FLAG_REQUEST_ID`, others rejected), `deadline_ms:u32`, then `n_entries × {expert:u16, replica:u8, reserved:u8, gate:f32}`, then `request_id:u64` if flagged |
+| `BRSP` (exact, default) | 7 | header + `n_reduced` stacked `gate_j*y_j` rows + `n_reduced:u16`, `flags:u16` = `0x0001` (`RSP_FLAG_PER_EXPERT`) \| `0x0002` (`RSP_FLAG_REQUEST_ID`), then `n_reduced × expert:u16` tags in row order, then the echoed `request_id:u64` if flagged |
+| `BRSP` (fast, opt-in) | 7 | header + one partial sum + `n_reduced:u16`, `flags:u16` (`RSP_FLAG_PER_EXPERT` clear), then the echoed `request_id:u64` if flagged |
+| `BERR` | 8 | header + `[0.0]` + `code:u16`, `n_failures:u16`, then `n_failures × {expert:u16, reason:u16, node_len:u16, node bytes}`, then `detail_len:u16` + UTF-8 detail, then optionally the echoed `request_id:u64` (a trailer of any other length is refused) |
 
 The activation travels **once per subcluster request** — 8 bytes per additional
 expert instead of another 28 KB at K3 width (hidden 7168, fp32) — which is the
@@ -328,6 +328,99 @@ included. The three process tiers are started like this:
 `--size`, `--expert-host`/`--expert-port-base`, `--head-host`/`--head-port-base`).
 A head server exits cleanly on SIGINT/SIGTERM, reporting how many batches it
 served.
+
+### Regional coordinators: the same tier, one level up
+
+Condor's heads answered to servers above them, and one layer coordinator holding
+78 head connections per layer is the bottleneck the heads were meant to remove.
+`regional.py` adds that tier without adding a protocol: `RegionalCoordinator`
+subclasses the same `BaseCoordinator` as `SubclusterCoordinator` (shutdown
+checks, ownership checks, fast-mode policy, deadline arithmetic, dedup) and its
+downstream side is a `SubclusterTransport` — the *layer's* client code. A region
+is therefore a head server whose "consoles" are head servers, and a fourth tier
+is the same pair again.
+
+```
+                 layer coordinator          (HierarchicalExpertDispatcher over a TieredPlan)
+                  |                    |
+        BREQ per *region*, activation once, entries tagged with global top-k positions
+                  v                    v
+        region rg-0000            region rg-0001         (RegionalCoordinator +
+        primary + standby…        primary + standby…      CoordinatorService)
+          |          |
+        BREQ per *head*, activation once again per immediate downstream group
+          v          v
+        head sc-0000  head sc-0001  …                    (SubclusterCoordinator)
+          |             |
+        22 consoles    22 consoles                       (P3XC REQ/RSP)
+```
+
+`ClusterConfig.tiered_plan()` returns a `TieredPlan` (consoles → heads →
+regions): the layer groups a token's top-k by region, each region regroups its
+slice by head. **No tier reduces in exact mode**, so bit identity is a property
+of the depth-independent rule "only the layer adds, in its own top-k order":
+`tests/test_three_tier.py` asserts `np.array_equal` against
+`DistributedExpertDispatcher` over randomised routings whose positions interleave
+across both regions and subclusters, with reversed completion order. Fast mode
+nests too — partials of partials — and is correspondingly *more* re-associated.
+A config with no `regions` block still drives the two-tier path, and the flat
+dispatcher still drives the one-tier path; canonical placement is untouched at
+every depth.
+
+**Coordinator replicas and health steering.** Every coordinator address in the
+config is an ordered list (`"standby": [{"host": …, "port": …}]`) at layer→region
+and region→head alike, in addition to the existing expert replicas. The
+transport sends to the first endpoint it believes is alive and walks the list on
+failure. `PING`/`PONG` only *steers* that preference: an endpoint marked dead is
+sorted last, never removed, so a wrongly-marked or never-probed address is still
+tried when it is the only one left — correctness never depends on health state.
+Head servers and regions are stateless, so a standby is just another listener on
+the same `cluster.json` (`--standby N`).
+
+**Request identity.** Each batch carries a 64-bit id (`next_request_id()`:
+process-random high bits + a counter, so two layer coordinators cannot mint the
+same id) which every coordinator echoes in its `BRSP` *and* its `BERR`, and which
+a retry of the same logical batch reuses. An answer naming a different id is
+refused rather than reduced. Correlation on the wire still keys on
+`(layer, 0xFFFF, token_id)`; the id is the *logical* identity on top of it.
+
+**Retry classes on a coordinator link (`LinkRetryPolicy`).**
+
+| Class | What the caller can prove | Default |
+|---|---|---|
+| safe-before-send | no endpoint accepted the connection or the frame; downstream cannot have started | retried on the next endpoint (`retry_safe=True`) — at-most-once |
+| ambiguous | timeout, or the link died after the frame went out; downstream may be running or finished | **not** retried; `retry_ambiguous=True` opts in — at-least-once execution |
+| wrong identity | the answer echoes another request id | refused, never reduced |
+
+On an ambiguous failure the attempt's correlation key is retired and the endpoint
+is marked dead before the retry, so the abandoned answer is dropped rather than
+summed. **Exactly-once reduction is preserved in every class**; only *execution*
+weakens, and only when explicitly opted into.
+
+**Bounded idempotency (`dedup.py`).** A coordinator remembers the response frame
+per request id in a `DedupCache`: a retry that lands on the *same* process (a
+reconnect, or the caller reaching it through another of its own addresses)
+replays that frame instead of fanning out again, and a duplicate arriving while
+the first attempt is still running waits for it rather than starting a second.
+The cache is bounded and expiring — `--dedup-entries` (128) and `--dedup-ttl`
+(60 s), LRU eviction, failed attempts not remembered — so no unbounded per-token
+state accumulates; an evicted or expired id honestly re-executes. A retry that
+lands on a *different* replica process cannot be recognised: there is no shared
+store, and introducing one would mean a consensus dependency this design
+refuses. That case is at-least-once execution with exactly-once reduction, and
+it is documented rather than papered over.
+
+**Launching the third tier.**
+
+| Tier | Command |
+|---|---|
+| region | `python3 tools/run_region.py --config cluster.json --region rg-0000`; `--standby N` serves the region's Nth extra address, `--attempts`/`--retry-ambiguous` set the link policy, `--dedup-entries`/`--dedup-ttl` bound the replay cache, `--refuse-fast` rejects approximate batches, `--list`/`--check-members` inspect without serving |
+| layer | `SubclusterTransport(config.region_endpoints())` + `HierarchicalExpertDispatcher(config.placement(), config.tiered_plan(), transport)` |
+
+`tools/gen_cluster_config.py --regions N --region-host … --region-port-base …`
+writes the three-tier config, dealing heads out contiguously so a token's top-k
+lands in few regions. `tests/test_deployment_cli.py` brings the whole thing up as
+real processes through these CLIs and compares against the flat dispatcher.
 
 ### Failure semantics
 
@@ -454,7 +547,10 @@ timing-sensitive:
 | `test_subcluster.py` | grouping into 22s, stability, partial/hierarchical reduction, dispatch reduced through two subclusters |
 | `test_failover.py` | replica registration, safe-only retries, `ERR`/timeout policies, and per-node request counts proving no expert is counted twice |
 | `test_batch_protocol.py` | batch frame round-trips for both response shapes, the `REQ_FLAG_FAST`/`RSP_FLAG_PER_EXPERT` flags and unassigned-flag rejection, per-expert rows surviving the wire bit for bit with their tags, forged row counts and duplicate tags refused, activation carried once regardless of k, bounded counts/strings, reserved-field and duplicate-expert rejection, truncation, version mismatch, expert-frame compatibility |
-| `test_deployment.py` | JSON config round-trip, canonical placement with additive replicas, plan built from declared membership, size/duplicate validation, 22-console grouping |
+| `test_deployment.py` | JSON config round-trip, canonical placement with additive replicas, plan built from declared membership, size/duplicate validation, 22-console grouping, region declarations with ordered standby addresses, per-region head endpoints and `TieredPlan`, region generation, and two-tier configs still loading |
+| `test_dedup.py` | bounded replay: a repeated id answered from cache without re-running, a duplicate arriving mid-flight waiting for the first, failures not remembered, TTL expiry, LRU eviction, counters, unflagged requests never cached |
+| `test_three_tier.py` | two regions over four head servers over eight consoles, in-process: three-tier output `np.array_equal` to the **flat dispatcher's own** output under randomised interleaving across regions *and* subclusters, positions preserved through both tiers, reverse-order completion, fast mode as an explicit partial (and a region refusing it), a dead region primary and a dead head primary failing over before send, both region endpoints down reported rather than reduced, a cold endpoint still tried when every endpoint is cold, heartbeat steering the next batch, timeout with opt-in ambiguous retry, a retry to the same process replaying instead of re-running, a retry to another replica executing twice but reduced once, a late duplicate answer dropped, a foreign request id refused, structured errors through both tiers, activation once per immediate downstream group, connection reuse across tokens, and socket/thread cleanup |
+| `test_deployment_cli.py` | the documented bring-up as real processes: `gen_cluster_config.py --regions` → four `run_expert.py` consoles → four `run_subcluster.py` heads → two `run_region.py` regions → a layer client whose output is `np.array_equal` to the flat dispatcher's over the same consoles; a `--standby` region process serving the same config, `--list`/`--check-members`, and a two-tier config refusing `--region` |
 | `test_hierarchy.py` | two live head servers over four consoles: default-mode output `np.array_equal` to the **flat dispatcher's own** output over the same consoles — across 12 randomised routings whose top-k positions interleave over three subclusters, when consoles complete in reverse position order, and when one contribution comes from a replica — plus fast mode matching the grouped reduction, the fast flag appearing only when asked for, its smaller reply, and a head server refusing fast batches; one `BREQ` per subcluster with the activation appearing exactly once on the wire (asserted through a byte-counting proxy), barriers proving concurrency within *and* across subclusters, two batches multiplexed on one upstream connection, upstream/downstream connection reuse, head-server and console heartbeats, malformed/oversized/unsupported frames, unreachable and erroring consoles as structured `BERR`, replica failover counting an expert once, deadline propagation, and socket/thread cleanup after `stop()` |
 
 On real hardware, `make ps3` (with the
@@ -465,9 +561,10 @@ cannot tell a simulated node from a real console.
 ## Status
 
 MVP. The dispatch layer, persistent pooled transport, concurrent top-k fan-out,
-heartbeats, subcluster planner, deployable per-subcluster coordinator processes
-with their batched wire format and JSON membership config, retry/failover hooks,
-wire protocol, MXFP4
+heartbeats, subcluster planner, deployable per-subcluster and regional
+coordinator processes with their batched wire format and JSON membership config,
+coordinator endpoint replicas with request ids and bounded replay,
+retry/failover hooks, wire protocol, MXFP4
 kernel, SwiGLU FFN, topology planner, host-sim worker, SPE kernel, and RSX shader
 backend (with a CPU-validated shader model) are implemented; the numeric path is tested end to
 end against a numpy reference. Not yet done: a coordinator shim that hangs
@@ -484,12 +581,17 @@ The coordination layer is validated on loopback sockets only. Nothing here has
 run on a physical PlayStation 3, and the latency/bandwidth characteristics of a
 real console farm (100 Mbit NICs, OtherOS hypervisor overhead) are not modelled.
 
-Further limitations of the deployed hierarchy specifically: the tree is two
-levels (layer → head → console) with no head-of-heads tier and no failover
-*between* head servers — a dead head server fails its subcluster's batches, and
-recovering means the layer retrying or the operator restarting it; head servers
-hold no state, so a restart is safe. Batching is per subcluster per token, not
-across tokens, and there is no load-aware choice among replicas. Default-mode
+Further limitations of the deployed hierarchy specifically: the tree is three
+levels (layer → region → head → console) and the coordinator abstraction is
+recursive, but only three levels are configurable through `ClusterConfig` — a
+fourth would need a config change, not a protocol one. A retry that reaches a
+*different* coordinator process re-executes the batch downstream (at-least-once
+execution, exactly-once reduction), because coordinators share no dedup state and
+nothing here introduces a consensus service to give them one. Health state is
+advisory: steering is per-transport and per-process, so a fresh layer coordinator
+still pays one failed attempt to discover a dead primary. Batching is per
+immediate downstream group per token, not across tokens, and there is no
+load-aware choice among replicas or regions. Default-mode
 replies cost `k` vectors upstream rather than one per subcluster, which is the
 price of bit identity; the opt-in fast mode trades that back for a partial sum
 and can change token choices (see numerics above). Requests on one console
