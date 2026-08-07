@@ -88,7 +88,8 @@ class TestBatchRequest(unittest.TestCase):
         body = B.encode_batch_request(0, 0, np.ones(2, np.float32),
                                       entries(1))[4:]
         head = len(body) - 8 - 8
-        forged = (body[:head] + struct.pack("!HHI", 1, 0x0001, 0)
+        # 0x0001 is REQ_FLAG_FAST; 0x0002 is not assigned.
+        forged = (body[:head] + struct.pack("!HHI", 1, 0x0002, 0)
                   + body[head + 8:])
         with self.assertRaises(P.ProtocolError) as ctx:
             B.decode_batch_request(forged)
@@ -107,6 +108,15 @@ class TestBatchRequest(unittest.TestCase):
         with self.assertRaises(P.ProtocolError) as ctx:
             B.decode_batch_request(body)
         self.assertIn("twice", str(ctx.exception))
+
+    def test_fast_flag_roundtrips_and_defaults_off(self):
+        x = np.ones(2, np.float32)
+        plain = B.decode_batch_request(
+            B.encode_batch_request(0, 0, x, entries(1))[4:])
+        self.assertFalse(plain["fast"])
+        quick = B.decode_batch_request(
+            B.encode_batch_request(0, 0, x, entries(1), fast=True)[4:])
+        self.assertTrue(quick["fast"])
 
     def test_reserved_byte_must_be_zero(self):
         body = bytearray(B.encode_batch_request(0, 0, np.ones(2, np.float32),
@@ -143,6 +153,8 @@ class TestBatchResponse(unittest.TestCase):
         np.testing.assert_array_equal(msg["array"], partial)
         self.assertEqual(msg["n_reduced"], 3)
         self.assertEqual(msg["token_id"], 11)
+        self.assertFalse(msg["per_expert"])
+        self.assertEqual(msg["experts"], [])
 
     def test_zero_reduced_rejected(self):
         with self.assertRaises(P.ProtocolError):
@@ -152,6 +164,65 @@ class TestBatchResponse(unittest.TestCase):
         body = B.encode_batch_response(0, 0, np.ones(2, np.float32), 1)[4:]
         with self.assertRaises(P.ProtocolError):
             B.decode_batch_response(body + b"\x00\x00")
+
+
+class TestBatchContributions(unittest.TestCase):
+    """The exact (default) response shape: one tagged row per expert."""
+
+    def test_roundtrip_keeps_rows_and_tags(self):
+        rows = [np.array([1.5, -2.25], dtype=np.float32),
+                np.array([0.5, 8.0], dtype=np.float32)]
+        msg = B.decode_batch_response(
+            B.encode_batch_contributions(4, 11, rows, [7, 2])[4:])
+        self.assertTrue(msg["per_expert"])
+        self.assertEqual(msg["n_reduced"], 2)
+        self.assertEqual(msg["experts"], [7, 2])
+        np.testing.assert_array_equal(msg["array"], np.stack(rows))
+
+    def test_row_bits_survive_the_wire(self):
+        rng = np.random.default_rng(7)
+        rows = [rng.standard_normal(9).astype(np.float32) for _ in range(3)]
+        msg = B.decode_batch_response(
+            B.encode_batch_contributions(0, 0, rows, [0, 1, 2])[4:])
+        for got, want in zip(msg["array"], rows):
+            np.testing.assert_array_equal(got, want)
+
+    def test_empty_and_mismatched_rejected(self):
+        with self.assertRaises(P.ProtocolError):
+            B.encode_batch_contributions(0, 0, [], [])
+        with self.assertRaises(P.ProtocolError):
+            B.encode_batch_contributions(0, 0, [np.ones(2, np.float32)], [1, 2])
+
+    def test_duplicate_expert_tag_rejected(self):
+        body = B.encode_batch_contributions(
+            0, 0, [np.ones(2, np.float32)] * 2, [3, 3])[4:]
+        with self.assertRaises(P.ProtocolError) as ctx:
+            B.decode_batch_response(body)
+        self.assertIn("twice", str(ctx.exception))
+
+    def test_tag_count_must_match_the_rows(self):
+        body = B.encode_batch_contributions(
+            0, 0, [np.ones(2, np.float32)] * 2, [3, 4])[4:]
+        with self.assertRaises(P.ProtocolError):
+            B.decode_batch_response(body + b"\x00\x05")
+
+    def test_row_count_must_match_the_header(self):
+        """A forged count cannot make the layer read rows that are not there."""
+        body = bytearray(B.encode_batch_contributions(
+            0, 0, [np.ones(2, np.float32)] * 2, [3, 4])[4:])
+        body[-8:-6] = struct.pack("!H", 3)   # n_reduced, but only 2 rows
+        body.extend(b"\x00\x05")             # and a third tag
+        with self.assertRaises(P.ProtocolError) as ctx:
+            B.decode_batch_response(bytes(body))
+        self.assertIn("contributions", str(ctx.exception))
+
+    def test_unsupported_response_flag_rejected(self):
+        body = bytearray(B.encode_batch_contributions(
+            0, 0, [np.ones(2, np.float32)], [3])[4:])
+        body[-4:-2] = struct.pack("!H", 0x0004)
+        with self.assertRaises(P.ProtocolError) as ctx:
+            B.decode_batch_response(bytes(body))
+        self.assertIn("flags", str(ctx.exception))
 
 
 class TestBatchError(unittest.TestCase):

@@ -12,8 +12,11 @@
         --subcluster sc-0000 --check-members
 
 The process listens for P3XC batch frames from the layer coordinator, keeps
-persistent pooled connections to its own consoles, and answers each batch with a
-single partial sum. Ctrl-C drains in-flight batches and closes every socket.
+persistent pooled connections to its own consoles, and answers each batch with
+one weighted contribution per expert, so the layer's reduction stays
+bit-identical to the flat dispatcher. A layer may set the request's fast flag to
+get a single partial sum instead; ``--refuse-fast`` rejects such requests here.
+Ctrl-C drains in-flight batches and closes every socket.
 """
 import argparse
 import json
@@ -41,6 +44,10 @@ def main() -> int:
     ap.add_argument("--attempts", type=int, default=2,
                     help="tries per expert; retried only when a failure "
                          "provably never reached a console")
+    ap.add_argument("--refuse-fast", action="store_true",
+                    help="reject fast (single partial sum) batches, which "
+                         "re-associate the layer's fp32 reduction and can "
+                         "change token choices")
     ap.add_argument("--list", action="store_true",
                     help="print the config's subclusters and exit")
     ap.add_argument("--check-members", action="store_true",
@@ -60,7 +67,8 @@ def main() -> int:
     coordinator = SubclusterCoordinator(
         spec.group_id, config.placement(spec.group_id),
         config.expert_endpoints(spec.group_id), timeout=args.timeout,
-        retry_policy=RetryPolicy(attempts=args.attempts))
+        retry_policy=RetryPolicy(attempts=args.attempts),
+        allow_fast=not args.refuse_fast)
 
     if args.check_members:
         try:

@@ -206,12 +206,13 @@ instead of to consoles.
      SubclusterCoordinator      SubclusterCoordinator     SubclusterService)
        | | | ... (<=22)           | | | ... (<=22)
      P3XC REQ/RSP over the *same* pooled persistent transport as the flat path,
-     fanned out concurrently, gate-scaled, summed in ascending expert order
+     fanned out concurrently and gate-scaled, but *not* summed
               |                       |
-     BRSP: one partial sum      BRSP: one partial sum
+     BRSP: gate_j*y_j per expert, each row tagged with its expert
               \_______________________/
                           v
-            layer sums partials in ascending group id order
+            layer sums the rows in ascending original top-k position,
+            with the same fp32 adds as DistributedExpertDispatcher
 ```
 
 **Wire format (`batch.py`).** Three new P3XC message types reuse the existing
@@ -221,8 +222,9 @@ length prefixing is unchanged:
 
 | Type | Value | Body |
 |---|---|---|
-| `BREQ` | 6 | header (`expert=0xFFFF`) + activation + `n_entries:u16`, `flags:u16` (must be 0), `deadline_ms:u32`, then `n_entries × {expert:u16, replica:u8, reserved:u8, gate:f32}` |
-| `BRSP` | 7 | header + partial sum + `n_reduced:u16`, `flags:u16` |
+| `BREQ` | 6 | header (`expert=0xFFFF`) + activation + `n_entries:u16`, `flags:u16` (`0x0001` = `REQ_FLAG_FAST`, others rejected), `deadline_ms:u32`, then `n_entries × {expert:u16, replica:u8, reserved:u8, gate:f32}` |
+| `BRSP` (exact, default) | 7 | header + `n_reduced` stacked `gate_j*y_j` rows + `n_reduced:u16`, `flags:u16` = `0x0001` (`RSP_FLAG_PER_EXPERT`), then `n_reduced × expert:u16` tags in row order |
+| `BRSP` (fast, opt-in) | 7 | header + one partial sum + `n_reduced:u16`, `flags:u16` = 0 |
 | `BERR` | 8 | header + `[0.0]` + `code:u16`, `n_failures:u16`, then `n_failures × {expert:u16, reason:u16, node_len:u16, node bytes}`, then `detail_len:u16` + UTF-8 detail |
 
 The activation travels **once per subcluster request** — 8 bytes per additional
@@ -249,7 +251,7 @@ request past the layer's budget. `SubclusterService.stop()` stops accepting,
 drains in-flight batches, joins the accept thread, and closes the downstream
 transport and its reader threads.
 
-**Execution vs reduction semantics.** A subcluster returns either a partial
+**Execution vs reduction semantics.** A subcluster returns either a response
 covering *every* requested expert (after any configured replica failover) or a
 `BERR` naming each failed expert, its reason and its console — surfaced to the
 layer as `SubclusterError`, whose `safe_to_retry` is true only when every named
@@ -264,12 +266,37 @@ primary is down does not pay the failed attempt again; a hint naming a replica
 that is not configured is answered `BERR ERR_BAD_REQUEST` rather than silently
 falling back to the primary.
 
-**Numerics.** Contributions are summed in ascending expert order within a
-subcluster and partials in ascending group-id order — bit-identical to the
-in-process `hierarchical_reduce`, and bit-identical to the flat top-k sum when a
-single subcluster covers the stage. With several subclusters the grouping
-re-associates float32 additions, so the result may differ from the flat sum in
-the last bits; both orders are fixed and reproducible.
+**Numerics: exact by default.** A head server must not collapse its slice of the
+top-k to one fp32 partial, because that slice is generally *not contiguous* in
+the layer's order: for positions `a0, b1, a2` split over groups `a` and `b`,
+grouping computes `(a0 + a2) + b1` where the flat path computes
+`(a0 + b1) + a2`, and those differ in the last bits, which is enough to move a
+logit and therefore a token choice. So in the default mode the head server
+scales but does not reduce: its `BRSP` carries one `gate_j * y_j` row per
+expert, each tagged with its expert id, and the layer places each row back at
+the top-k position it asked for and accumulates strictly in ascending position
+with the same float32 adds as `DistributedExpertDispatcher.reduce`. The
+deployed hierarchical result is therefore **bit-identical to flat dispatch**
+(`np.array_equal`), independently of how positions interleave across
+subclusters, of completion order, and of whether an expert was served by a
+replica. A response tagged with an expert the layer did not request, or carrying
+a single partial when rows were asked for, is refused rather than reduced.
+
+The price is upstream bandwidth: `k` vectors instead of one per subcluster (the
+*activation* still travels once, so a batch is still far cheaper than one
+request per expert). That tradeoff is deliberate — bit identity is mandatory.
+
+**Fast mode (opt-in, approximate).** `REQ_FLAG_FAST` — exposed as
+`HierarchicalExpertDispatcher(..., fast=True)`, `run_expert_stage(...,
+fast=True)`, `submit_expert_stage(..., fast=True)` and
+`SubclusterTransport.submit_batch(..., fast=True)` — asks each head server for a
+single partial sum, reducing in ascending expert order within the group and
+ascending group id at the layer. It saves upstream bytes and matches the
+in-process `hierarchical_reduce`, and it is reproducible, but it re-associates
+the float32 additions: **logits, and therefore sampled tokens, can differ from
+the flat path**. It is never the default, and a head server run with
+`--refuse-fast` (`SubclusterCoordinator(..., allow_fast=False)`) answers such a
+batch with `BERR ERR_BAD_REQUEST` instead of a partial.
 
 **Configuration (`deployment.py`).** One JSON document declares which head
 server fronts which consoles, and both ends read it, so the two sides cannot
@@ -426,9 +453,9 @@ timing-sensitive:
 | `test_async_dispatch.py` | top-k experts running simultaneously (a barrier that a serial dispatcher cannot satisfy — with `max_workers=1` as the control), bit-identical reduction, error cleanup, liveness |
 | `test_subcluster.py` | grouping into 22s, stability, partial/hierarchical reduction, dispatch reduced through two subclusters |
 | `test_failover.py` | replica registration, safe-only retries, `ERR`/timeout policies, and per-node request counts proving no expert is counted twice |
-| `test_batch_protocol.py` | batch frame round-trips, activation carried once regardless of k, bounded counts/strings, reserved-field and duplicate-expert rejection, truncation, version mismatch, expert-frame compatibility |
+| `test_batch_protocol.py` | batch frame round-trips for both response shapes, the `REQ_FLAG_FAST`/`RSP_FLAG_PER_EXPERT` flags and unassigned-flag rejection, per-expert rows surviving the wire bit for bit with their tags, forged row counts and duplicate tags refused, activation carried once regardless of k, bounded counts/strings, reserved-field and duplicate-expert rejection, truncation, version mismatch, expert-frame compatibility |
 | `test_deployment.py` | JSON config round-trip, canonical placement with additive replicas, plan built from declared membership, size/duplicate validation, 22-console grouping |
-| `test_hierarchy.py` | two live head servers over four consoles: partial sums bit-identical to in-process grouped reduction (and to flat dispatch with one subcluster), one `BREQ` per subcluster with the activation appearing exactly once on the wire (asserted through a byte-counting proxy), barriers proving concurrency within *and* across subclusters, two batches multiplexed on one upstream connection, upstream/downstream connection reuse, head-server and console heartbeats, malformed/oversized/unsupported frames, unreachable and erroring consoles as structured `BERR`, replica failover counting an expert once, deadline propagation, and socket/thread cleanup after `stop()` |
+| `test_hierarchy.py` | two live head servers over four consoles: default-mode output `np.array_equal` to the **flat dispatcher's own** output over the same consoles — across 12 randomised routings whose top-k positions interleave over three subclusters, when consoles complete in reverse position order, and when one contribution comes from a replica — plus fast mode matching the grouped reduction, the fast flag appearing only when asked for, its smaller reply, and a head server refusing fast batches; one `BREQ` per subcluster with the activation appearing exactly once on the wire (asserted through a byte-counting proxy), barriers proving concurrency within *and* across subclusters, two batches multiplexed on one upstream connection, upstream/downstream connection reuse, head-server and console heartbeats, malformed/oversized/unsupported frames, unreachable and erroring consoles as structured `BERR`, replica failover counting an expert once, deadline propagation, and socket/thread cleanup after `stop()` |
 
 On real hardware, `make ps3` (with the
 [ps3dev toolchain](https://github.com/ps3dev/ps3toolchain)) builds the identical
@@ -462,10 +489,11 @@ levels (layer → head → console) with no head-of-heads tier and no failover
 *between* head servers — a dead head server fails its subcluster's batches, and
 recovering means the layer retrying or the operator restarting it; head servers
 hold no state, so a restart is safe. Batching is per subcluster per token, not
-across tokens, and there is no load-aware choice among replicas. A multi-
-subcluster hierarchical sum is reproducible but not bit-identical to the flat
-sum (see numerics above). Requests on one console connection remain sequential,
-as before.
+across tokens, and there is no load-aware choice among replicas. Default-mode
+replies cost `k` vectors upstream rather than one per subcluster, which is the
+price of bit identity; the opt-in fast mode trades that back for a partial sum
+and can change token choices (see numerics above). Requests on one console
+connection remain sequential, as before.
 
 ## Prior art
 
