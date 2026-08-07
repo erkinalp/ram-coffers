@@ -42,7 +42,9 @@ from .coordinator import (BaseCoordinator, SubclusterCoordinator,
                           SubclusterServer, SubclusterService,
                           serve_subcluster)
 from .regional import RegionalCoordinator, serve_region, region_addresses
-from .dedup import DedupCache, DEFAULT_DEDUP_ENTRIES, DEFAULT_DEDUP_TTL
+from .dedup import (DedupCache, DEFAULT_DEDUP_BYTES, DEFAULT_DEDUP_ENTRIES,
+                    DEFAULT_DEDUP_TTL, DedupCapacityError,
+                    MismatchedRequestError)
 from .hierarchy import (SubclusterTransport, HierarchicalExpertDispatcher,
                         HierarchicalStage, PendingBatch, LinkRetryPolicy,
                         next_request_id)
@@ -71,7 +73,8 @@ __all__ = [
     "CoordinatorServer", "CoordinatorService", "SubclusterServer",
     "SubclusterService", "serve_subcluster", "RegionalCoordinator",
     "serve_region", "region_addresses", "DedupCache",
-    "DEFAULT_DEDUP_ENTRIES", "DEFAULT_DEDUP_TTL", "SubclusterTransport",
+    "DEFAULT_DEDUP_ENTRIES", "DEFAULT_DEDUP_TTL", "DEFAULT_DEDUP_BYTES",
+    "DedupCapacityError", "MismatchedRequestError", "SubclusterTransport",
     "HierarchicalExpertDispatcher", "HierarchicalStage", "PendingBatch",
     "LinkRetryPolicy", "next_request_id",
     "ClusterConfig", "SubclusterSpec", "RegionSpec", "MemberSpec",

@@ -38,8 +38,8 @@ import threading
 import time
 import numpy as np
 
-from .errors import (NodeConnectError, NodeError, NodeTimeout,
-                     TransportError)
+from .errors import (NodeConnectError, NodeDisconnected, NodeError,
+                     NodeTimeout, TransportError)
 from .protocol import (encode, decode, MSG_REQ, MSG_RSP, MSG_ERR, ProtocolError,
                        read_frame)
 from .subcluster import SubclusterPlan, hierarchical_reduce
@@ -192,23 +192,26 @@ class RetryPolicy:
     * ``retry_on_node_error`` retries an explicit ``ERR`` frame. An ``ERR``
       carries no output activation, so this also cannot double-count; it is off
       by default because the same node will usually fail the same way.
-    * ``retry_on_timeout`` retries a request that may still be executing on the
-      node. That makes the call **at-least-once**: the expert may run twice on
-      the cluster. Only the first response received is ever reduced, so the
-      *result* is still counted once, but the node-side work is not idempotent
-      in wall-clock terms and a stale response is dropped, never summed.
+    * ``retry_on_timeout`` retries when a node's deadline expires before any
+      response arrives. The request may still be executing, so this is
+      **at-least-once** execution (the *result* is still reduced exactly once).
+    * ``retry_on_disconnect`` retries when a connection drops while requests are
+      in flight. Like timeout, this can execute the expert twice; the first
+      arriving response is the one that is used.
     * ``use_replicas`` sends the retry to the next replica endpoint registered
       with :meth:`ExpertPlacement.assign_replica`, falling back to the primary
       when no replica exists.
     """
 
     def __init__(self, attempts: int = 2, retry_on_node_error: bool = False,
-                 retry_on_timeout: bool = False, use_replicas: bool = True):
+                 retry_on_timeout: bool = False,
+                 retry_on_disconnect: bool = False, use_replicas: bool = True):
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
         self.attempts = attempts
         self.retry_on_node_error = retry_on_node_error
         self.retry_on_timeout = retry_on_timeout
+        self.retry_on_disconnect = retry_on_disconnect
         self.use_replicas = use_replicas
 
     def should_retry(self, exc: BaseException) -> bool:
@@ -217,7 +220,11 @@ class RetryPolicy:
         if isinstance(exc, TransportError):
             if exc.safe_to_retry:
                 return True
-            return self.retry_on_timeout
+            if isinstance(exc, NodeDisconnected):
+                return self.retry_on_disconnect
+            if isinstance(exc, NodeTimeout):
+                return self.retry_on_timeout
+            return False
         return False
 
     @classmethod

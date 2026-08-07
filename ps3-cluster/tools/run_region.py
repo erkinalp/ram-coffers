@@ -37,8 +37,8 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ps3_cluster.coordinator import CoordinatorService
-from ps3_cluster.dedup import (DEFAULT_DEDUP_ENTRIES, DEFAULT_DEDUP_TTL,
-                               DedupCache)
+from ps3_cluster.dedup import (DEFAULT_DEDUP_BYTES, DEFAULT_DEDUP_ENTRIES,
+                               DEFAULT_DEDUP_TTL, DedupCache)
 from ps3_cluster.deployment import ClusterConfig
 from ps3_cluster.hierarchy import LinkRetryPolicy
 from ps3_cluster.regional import RegionalCoordinator
@@ -65,9 +65,11 @@ def main() -> int:
                          "connection, which is at-least-once execution "
                          "downstream (the layer still reduces one answer)")
     ap.add_argument("--dedup-entries", type=int, default=DEFAULT_DEDUP_ENTRIES,
-                    help="bound on remembered request ids")
+                    help="max logical batches tracked (in flight or cached)")
     ap.add_argument("--dedup-ttl", type=float, default=DEFAULT_DEDUP_TTL,
-                    help="seconds a remembered answer stays replayable")
+                    help="seconds a completed answer stays replayable")
+    ap.add_argument("--dedup-bytes", type=int, default=DEFAULT_DEDUP_BYTES,
+                    help="total completed-response byte budget")
     ap.add_argument("--refuse-fast", action="store_true",
                     help="reject fast (partial sum) batches, which "
                          "re-associate the layer's fp32 reduction and can "
@@ -97,7 +99,8 @@ def main() -> int:
         retry_policy=LinkRetryPolicy(attempts=args.attempts,
                                      retry_ambiguous=args.retry_ambiguous),
         allow_fast=not args.refuse_fast,
-        dedup=DedupCache(max_entries=args.dedup_entries, ttl=args.dedup_ttl))
+        dedup=DedupCache(max_entries=args.dedup_entries, ttl=args.dedup_ttl,
+                         max_bytes=args.dedup_bytes))
 
     if args.check_members:
         try:
@@ -109,11 +112,10 @@ def main() -> int:
 
     listen = spec.endpoint
     if args.standby is not None:
-        try:
-            listen = spec.standby[args.standby]
-        except IndexError:
+        if not 0 <= args.standby < len(spec.standby):
             ap.error(f"{spec.region_id} has {len(spec.standby)} standby "
                      f"addresses, no index {args.standby}")
+        listen = spec.standby[args.standby]
     host_arg = args.host or listen[0]
     port_arg = listen[1] if args.port is None else args.port
     service = CoordinatorService(coordinator, host=host_arg,

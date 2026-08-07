@@ -91,6 +91,7 @@ hostile or corrupt frame cannot make a coordinator allocate without limit.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -142,6 +143,7 @@ ERR_NODE_ERROR = 5           #: worker answered ERR
 ERR_NODE_DISCONNECTED = 6    #: peer closed mid-request
 ERR_BAD_REQUEST = 7          #: malformed or unsupported batch frame
 ERR_SHUTTING_DOWN = 8
+ERR_DEDUP_CAPACITY = 9       #: dedup cache cannot accept another in-flight batch
 
 _ENTRY = struct.Struct("!HBBf")
 _COUNT = struct.Struct("!HH")
@@ -438,6 +440,29 @@ def parse_batch_error(msg: dict) -> dict:
 
 
 # -- shared -----------------------------------------------------------------
+def batch_fingerprint(msg: dict) -> bytes:
+    """Stable 256-bit fingerprint of a decoded BREQ, ignoring ``request_id``.
+
+    The request id is a retry handle, not part of the logical batch: the same
+    activation, token, layer, deadline, entries and fast flag must hash to the
+    same fingerprint even if the id is reused by the caller.
+    """
+    h = hashlib.sha256()
+    h.update(struct.pack("!IIII", msg["layer"], msg["token_id"],
+                         int(msg.get("fast", False)),
+                         msg.get("deadline_ms", 0)))
+    arr = msg["array"]
+    h.update(struct.pack("!BB", arr.dtype.itemsize, arr.ndim))
+    h.update(struct.pack(f"!{arr.ndim}I", *arr.shape))
+    h.update(arr.tobytes())
+    entries = msg["entries"]
+    h.update(struct.pack("!I", len(entries)))
+    for entry in entries:
+        h.update(struct.pack("!HBBf", entry.expert, entry.replica, 0,
+                             float(entry.gate)))
+    return h.digest()
+
+
 def decode_batch(body: bytes) -> dict:
     """Decode any subcluster frame, dispatching on ``msg_type``."""
     if len(body) > MAX_FRAME_BYTES:
