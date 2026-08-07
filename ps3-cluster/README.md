@@ -20,8 +20,12 @@ python3 tools/plan_k3.py                     # size the cluster for Kimi K3
 
 - **Python coordinator side** (`ps3_cluster/`): the #316 port. `dispatch.py`
   turns the router's top-k decision into activations sent to the owning consoles
-  instead of local disk loads; `topology.py` plans the 1-expert/node layout;
-  `protocol.py` is the big-endian wire codec; `node.py` is a reference
+  instead of local disk loads, fanning the top-k calls out concurrently;
+  `transport.py` holds persistent pooled P3XC connections with several requests
+  in flight per node; `subcluster.py` groups nodes into Condor-style
+  subclusters of 22 for hierarchical fan-out; `errors.py` is the
+  node-attributed failure hierarchy; `topology.py` plans the 1-expert/node
+  layout; `protocol.py` is the big-endian wire codec; `node.py` is a reference
   (numpy) expert worker.
 - **Cell kernels** (`common/`, `spu/`, `ppu/`): the MVP compute path. `mxfp4.h`
   dequantises microscaling-FP4; `expert_spu.c` is the SPE GEMV kernel with
@@ -35,6 +39,57 @@ python3 tools/plan_k3.py                     # size the cluster for Kimi K3
   (real) or `GEMV_RSX_EMU` (emulated); see `../docs/PS3_CLUSTER_PORT.md`.
 - **`cell-compat.h`**: the PS3 analogue of `power8-compat.h` — big-endian ppc64,
   classic AltiVec only (no VSX/MMA), SPE local-store budget.
+
+## Asynchronous coordination
+
+A token at K3 scale touches ~16 consoles per layer across 92 layers. Two things
+make that affordable, both taken from how PS3 clusters and IBM's Cell
+middleware actually worked:
+
+**Persistent connections.** `SocketTransport` opens a TCP connection per
+dispatch; `PersistentSocketTransport` (alias `PooledSocketTransport`) keeps a
+bounded pool of long-lived connections per node, serialises writes, allows
+several requests in flight, and correlates responses by the frame's
+`(layer, expert, token_id)` identity so they may come back out of order. This
+is ALF's persistent per-accelerator work queue and DaCS's standing host↔
+accelerator channel, at cluster scale.
+
+**Concurrent top-k.** `DistributedExpertDispatcher.run_expert_stage` submits all
+selected experts together and reduces the results as they arrive; the summation
+itself happens in top-k order, so the output is bit-identical to the old serial
+reduction. `submit_expert_stage` returns a `DispatchStage` for callers that want
+several stages in flight.
+
+```python
+from ps3_cluster import (DistributedExpertDispatcher, ExpertPlacement,
+                         PersistentSocketTransport, RetryPolicy,
+                         SubclusterPlan)
+
+transport = PersistentSocketTransport(endpoints, timeout=30.0,
+                                      max_connections_per_node=4)
+dispatcher = DistributedExpertDispatcher(
+    placement, transport,
+    retry_policy=RetryPolicy(attempts=2),                # safe retries only
+    subclusters=SubclusterPlan(placement.node_ids(), 22))
+
+y = dispatcher.run_expert_stage(layer, x, expert_ids, gate_weights, token_id)
+alive = dispatcher.check_liveness(dispatcher.active_nodes_for(layer, expert_ids))
+dispatcher.close(); transport.close()
+```
+
+**Heartbeats.** `transport.ping(node)` / `.alive(node)` use the protocol's
+PING/PONG frames on the same connection as expert traffic; both the Python and C
+workers answer them. Failures raise node-attributed exceptions
+(`NodeConnectError`, `NodeError`, `NodeTimeout`, `NodeDisconnected`) so a log
+names the console, not "the cluster".
+
+**Failover.** `ExpertPlacement.assign_replica` registers optional standby
+consoles without changing canonical placement. Retries are opt-in per failure
+class: unreachable-node failures are retried (at-most-once, the request never
+arrived), `ERR` frames only with `retry_on_node_error=True`, and timeouts only
+with `retry_on_timeout=True` — which is **at-least-once execution**, though a
+stale response is dropped rather than summed, so a contribution is never
+double-counted. Full semantics: [`../docs/PS3_CLUSTER_PORT.md`](../docs/PS3_CLUSTER_PORT.md).
 
 ## Wiring into a real model (coordinator shim)
 
