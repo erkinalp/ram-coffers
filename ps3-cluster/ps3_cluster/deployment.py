@@ -330,13 +330,20 @@ class ClusterConfig:
                   consoles: Iterable[Tuple[int, str, Endpoint]],
                   size: int = DEFAULT_SUBCLUSTER_SIZE,
                   head_host: str = "0.0.0.0", head_port_base: int = 8100,
-                  prefix: str = "sc") -> "ClusterConfig":
+                  prefix: str = "sc", standby: int = 0,
+                  standby_host: Optional[str] = None) -> "ClusterConfig":
         """Group one layer's consoles into ``size``-console subclusters.
 
         ``consoles`` is ``(expert, node_id, (host, port))`` in the order the
         experts should be grouped; head servers are numbered from
         ``head_port_base``. This is the programmatic equivalent of writing the
         JSON by hand, used by ``tools/gen_cluster_config.py`` and the tests.
+
+        ``standby`` declares that many extra addresses per head server, which
+        is what a failover deployment needs: ``run_subcluster.py --standby N``
+        serves one. They are numbered in blocks after the primaries on the same
+        host unless ``standby_host`` says otherwise, so a real farm generates a
+        starting point here and edits the hosts.
         """
         specs: List[SubclusterSpec] = []
         members: List[MemberSpec] = []
@@ -350,16 +357,24 @@ class ClusterConfig:
         if members:
             specs.append(_head(prefix, len(specs), head_host, head_port_base,
                                members))
+        if standby:
+            addresses = standby_host or head_host
+            specs = [
+                spec._replace(standby=_extra_addresses(
+                    addresses, head_port_base, index, len(specs), standby))
+                for index, spec in enumerate(specs)]
         return cls(specs, subcluster_size=size)
 
     def with_regions(self, n_regions: int, host: str = "0.0.0.0",
                      port_base: int = 8200,
-                     prefix: str = "rg") -> "ClusterConfig":
+                     prefix: str = "rg", standby: int = 0,
+                     standby_host: Optional[str] = None) -> "ClusterConfig":
         """Copy of this config with its heads split across ``n_regions``.
 
         Heads are dealt out contiguously in declaration order, so a region
         fronts neighbouring experts and a token's top-k tends to land in few
-        regions.
+        regions. ``standby`` declares that many extra addresses per region, for
+        ``run_region.py --standby N``.
         """
         if n_regions < 1:
             raise ValueError("n_regions must be >= 1")
@@ -372,7 +387,10 @@ class ClusterConfig:
             RegionSpec(region_id=f"{prefix}-{index:04d}",
                        endpoint=(host, port_base + index),
                        subclusters=tuple(group_ids[index * per:
-                                                   (index + 1) * per]))
+                                                   (index + 1) * per]),
+                       standby=_extra_addresses(standby_host or host,
+                                                port_base, index, n_regions,
+                                                standby))
             for index in range(n_regions)]
         return ClusterConfig(self.subclusters,
                              subcluster_size=self.subcluster_size,
@@ -390,6 +408,17 @@ def _standby_doc(standby: Sequence[Endpoint]) -> dict:
         return {}
     return {"standby": [{"host": host, "port": port}
                         for host, port in standby]}
+
+
+def _extra_addresses(host: str, port_base: int, index: int, stride: int,
+                     count: int) -> Tuple[Endpoint, ...]:
+    """``count`` standby addresses for coordinator ``index`` of ``stride``.
+
+    Each standby generation occupies the next block of ``stride`` ports, so
+    they never collide with the primaries or with each other.
+    """
+    return tuple((host, port_base + stride * (slot + 1) + index)
+                 for slot in range(count))
 
 
 def _head(prefix: str, index: int, host: str, port_base: int,

@@ -202,6 +202,34 @@ class TestForLayer(unittest.TestCase):
         self.assertEqual(config.plan().subcluster_of("ps3-L001-E0003"),
                          "sc-0001")
 
+    def test_standby_addresses_are_generated_in_blocks(self):
+        consoles = [(e, f"ps3-L001-E{e:04d}", ("127.0.0.1", 9000 + e))
+                    for e in range(4)]
+        config = ClusterConfig.for_layer(
+            1, consoles, size=2, head_host="10.1.1.1", head_port_base=8200,
+            standby=2, standby_host="10.1.1.2").with_regions(
+                2, host="10.2.2.1", port_base=8300, standby=1,
+                standby_host="10.2.2.2")
+        self.assertEqual(config.group_endpoints(),
+                         {"sc-0000": [("10.1.1.1", 8200), ("10.1.1.2", 8202),
+                                      ("10.1.1.2", 8204)],
+                          "sc-0001": [("10.1.1.1", 8201), ("10.1.1.2", 8203),
+                                      ("10.1.1.2", 8205)]})
+        self.assertEqual(config.region_endpoints(),
+                         {"rg-0000": [("10.2.2.1", 8300), ("10.2.2.2", 8302)],
+                          "rg-0001": [("10.2.2.1", 8301), ("10.2.2.2", 8303)]})
+        reloaded = ClusterConfig.from_dict(config.to_dict())
+        self.assertEqual(reloaded.to_dict(), config.to_dict())
+
+    def test_standby_defaults_to_none_and_the_primary_host(self):
+        consoles = [(0, "ps3-L001-E0000", ("127.0.0.1", 9000))]
+        plain = ClusterConfig.for_layer(1, consoles, size=1)
+        self.assertEqual(plain.subclusters[0].standby, ())
+        near = ClusterConfig.for_layer(1, consoles, size=1,
+                                       head_host="10.1.1.1",
+                                       head_port_base=8200, standby=1)
+        self.assertEqual(near.subclusters[0].standby, (("10.1.1.1", 8201),))
+
 
 if __name__ == "__main__":
     unittest.main()

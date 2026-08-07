@@ -112,7 +112,9 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
              "--size", "1", "--expert-host", "127.0.0.1",
              "--head-host", "127.0.0.1", "--head-port-base", str(head_base),
              "--regions", "2", "--region-host", "127.0.0.1",
-             "--region-port-base", str(region_base), "-o", path],
+             "--region-port-base", str(region_base)]
+            + (["--region-standby", "1"] if standby else [])
+            + ["-o", path],
             capture_output=True, text=True, check=True)
         self.assertIn("2 regions", out.stdout)
         with open(path, encoding="utf-8") as fh:
@@ -120,8 +122,10 @@ class TestThreeTierDeploymentCli(unittest.TestCase):
         for spec, port in zip(doc["subclusters"], self.expert_ports):
             spec["members"][0]["port"] = port
         if standby:
-            doc["regions"][0]["standby"] = [{"host": "127.0.0.1",
-                                             "port": free_port()}]
+            self.assertEqual([[{"host": "127.0.0.1",
+                                "port": region_base + 2 + index}]
+                              for index in range(2)],
+                             [r["standby"] for r in doc["regions"]])
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(doc, fh)
         return path, ClusterConfig.from_dict(doc)

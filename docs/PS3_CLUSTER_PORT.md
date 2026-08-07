@@ -321,11 +321,17 @@ included. The three process tiers are started like this:
 | Tier | Command |
 |---|---|
 | console | `build/expert_node_host expert.exp <port>` (real hardware), or `python3 tools/run_expert.py expert.exp --port <port>` — the numpy reference worker, `--identity` for a trivial expert |
-| head server | `python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000`; `--host`/`--port` override the config, `--timeout` sets the downstream budget in seconds, `--attempts` the retries per expert, `--list` and `--check-members` inspect without serving |
+| head server | `python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000`; `--host`/`--port` override the config, `--standby N` serves the head's Nth extra address, `--timeout` sets the downstream budget in seconds, `--attempts` the retries per expert and `--retry-ambiguous` widens which failures are retried, `--dedup-entries`/`--dedup-ttl` bound the replay cache, `--refuse-fast` rejects approximate batches with `ERR_BAD_REQUEST`, `--list` and `--check-members` inspect without serving |
 | layer | any process holding a `SubclusterTransport` + `HierarchicalExpertDispatcher` over the same `cluster.json` (see `ps3-cluster/README.md`) |
 
 `tools/gen_cluster_config.py` writes the config for one layer (`--experts`,
-`--size`, `--expert-host`/`--expert-port-base`, `--head-host`/`--head-port-base`).
+`--size`, `--expert-host`/`--expert-port-base`, `--head-host`/`--head-port-base`,
+and `--head-standby N`/`--head-standby-host` for the extra head addresses that
+`--standby` serves; `--regions`/`--region-host`/`--region-port-base` and
+`--region-standby N`/`--region-standby-host` do the same one tier up). Standby
+ports are the next block after the primaries on the same host — usable as
+generated on one machine, and a starting point for a farm, where the hosts should
+be edited so a standby does not share a machine with the primary it covers.
 A head server exits cleanly on SIGINT/SIGTERM, reporting how many batches it
 served.
 
@@ -419,8 +425,11 @@ it is documented rather than papered over.
 
 `tools/gen_cluster_config.py --regions N --region-host … --region-port-base …`
 writes the three-tier config, dealing heads out contiguously so a token's top-k
-lands in few regions. `tests/test_deployment_cli.py` brings the whole thing up as
-real processes through these CLIs and compares against the flat dispatcher.
+lands in few regions; add `--region-standby N` (and `--head-standby N`) for the
+extra addresses `--standby` serves, or `--standby N` exits with `rg-0000 has 0
+standby addresses, no index 0`. `tests/test_deployment_cli.py` brings the whole
+thing up as real processes through these CLIs and compares against the flat
+dispatcher.
 
 ### Failure semantics
 
@@ -434,6 +443,12 @@ Failures are node-attributed (`errors.py`), so a log names the console:
 | `NodeError` | worker answered `ERR` | no by default — usually a placement/shape bug, not transient |
 | `PoolExhausted` | identical request already in flight on every pooled connection | yes |
 | `TransportClosed` | use after `close()` | no |
+
+A coordinator link carries the same exceptions, and tooling that inspects `.code`
+should expect two shapes: a coordinator that *answered* raises `SubclusterError`
+with the BERR `code` and per-expert `failures`, while a coordinator whose every
+configured address was unreachable raises `NodeConnectError` with `code=None` and
+no failures — nothing came back to carry them. Neither is ever reduced.
 
 `RetryPolicy` decides which of those are retried, and
 `ExpertPlacement.assign_replica(layer, expert, node)` registers optional standby
@@ -595,7 +610,9 @@ load-aware choice among replicas or regions. Default-mode
 replies cost `k` vectors upstream rather than one per subcluster, which is the
 price of bit identity; the opt-in fast mode trades that back for a partial sum
 and can change token choices (see numerics above). Requests on one console
-connection remain sequential, as before.
+connection remain sequential, as before. For non-PS3 model validation, a small
+Kimi-K3 checkpoint (e.g. `inference-optimization/Kimi-K3-0.40B` on Hugging Face)
+is a useful single-node/few-node target.
 
 ## Prior art
 

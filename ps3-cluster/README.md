@@ -109,8 +109,7 @@ python3 tools/gen_cluster_config.py --layer 3 --experts 44 \
 python3 tools/pack_expert.py L003-E0000.exp --layer 3 --expert 0
 python3 tools/run_expert.py L003-E0000.exp --port 9000
 
-# on each head server; --host/--port override the config, --timeout sets the
-# downstream budget in seconds and --attempts the retry count per expert
+# on each head server
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
 python3 tools/run_subcluster.py --config cluster.json --list
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
@@ -118,6 +117,21 @@ python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
     --refuse-fast                        # serve exact batches only
 ```
+
+`run_subcluster.py` options, all optional except `--config`:
+
+| option | meaning |
+| --- | --- |
+| `--subcluster ID` | which head to serve; required unless `--list` |
+| `--host H`, `--port P` | listen elsewhere than the config says (a NAT'd or test bring-up) |
+| `--standby N` | listen on the head's Nth extra config address instead (see three tiers below) |
+| `--timeout S` | downstream budget in seconds for one batch |
+| `--attempts N` | tries per expert across its primary and replicas |
+| `--retry-ambiguous` | also retry when a console may already have run the work |
+| `--dedup-entries N`, `--dedup-ttl S` | bound of the reconnect replay cache |
+| `--refuse-fast` | reject `fast` (partial-sum) batches with `ERR_BAD_REQUEST` |
+| `--list` | print every head in the config and exit |
+| `--check-members` | PING every console behind this head and exit |
 
 The layer coordinator reads the same file and talks only to the heads:
 
@@ -189,7 +203,8 @@ layer coordinator ─BREQ─▶ region rg-0000 (primary, standby…) ─BREQ─�
 ```bash
 python3 tools/gen_cluster_config.py --layer 3 --experts 88 \
     --expert-host 10.0.0.10 --head-host 10.0.1.1 \
-    --regions 2 --region-host 10.0.2.1 -o cluster.json
+    --regions 2 --region-host 10.0.2.1 \
+    --head-standby 1 --region-standby 1 -o cluster.json
 
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000
 python3 tools/run_subcluster.py --config cluster.json --subcluster sc-0000 \
@@ -202,6 +217,18 @@ python3 tools/run_region.py --config cluster.json --region rg-0000 \
 python3 tools/run_region.py --config cluster.json --region rg-0000 \
     --attempts 3 --retry-ambiguous       # see "retry semantics" below
 ```
+
+`--standby N` serves a coordinator's Nth extra address, so it needs those
+addresses to exist: `--head-standby N` / `--region-standby N` above declare them,
+numbered in the next block of ports after the primaries on the same host. That is
+right for a laptop bring-up and a starting point for a farm — pass
+`--head-standby-host` / `--region-standby-host`, or edit the `standby` blocks, so
+a standby does not share a machine with the primary it covers. Without them
+`--standby 0` exits with `rg-0000 has 0 standby addresses, no index 0`.
+
+`run_region.py` takes the same options as `run_subcluster.py`, with `--region ID`
+naming the region and `--check-members` pinging the heads under it rather than
+consoles.
 
 The layer coordinator points at the regions instead of the heads; nothing else
 about its code changes:
@@ -240,6 +267,12 @@ its BERR, and that a retry reuses:
 | no endpoint accepted the connection or the frame | downstream cannot have run | retried (`retry_safe`, at-most-once) |
 | timeout, or the link died after the frame went out | downstream **may** be running | not retried; `LinkRetryPolicy(retry_ambiguous=True)` opts in |
 | answer arrives naming another request id | not this batch | refused, never reduced |
+
+The two exception shapes differ in what a tool can read off them: a coordinator
+that answered with a BERR raises `SubclusterError` with the wire `code` set and
+per-expert `failures`, while a coordinator whose *every* address was unreachable
+raises `NodeConnectError` with `code=None` and no failures, because no frame ever
+came back to carry them. Both name the endpoint, and neither is ever reduced.
 
 An ambiguous retry is at-least-once *execution* and stays exactly-once
 *reduction*: the abandoned attempt's correlation key is retired, so its late
@@ -282,3 +315,11 @@ Install the [ps3dev toolchain](https://github.com/ps3dev/ps3toolchain), then:
 make ps3        # ppu-gcc + spu-gcc, SPU kernel embedded, libspe2 fan-out
 ./build/expert_node_ps3 expert_L07_E0042.exp 3830
 ```
+
+## Limitations and validation
+
+The coordination layer is tested on CPU-only loopback sockets; no physical PS3
+has run the cluster code. For smaller-model validation without the full 82 k
+node table, a tiny Kimi-K3 checkpoint such as
+`inference-optimization/Kimi-K3-0.40B` on Hugging Face is a good target for a
+single-node/few-node end-to-end run.
