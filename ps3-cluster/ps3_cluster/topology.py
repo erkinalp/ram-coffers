@@ -48,10 +48,19 @@ class ModelProfile:
     embed_bytes: int
     lm_head_bytes: int
     dtype: str = "mxfp4"
+    dense_layer_idxs: Optional[List[int]] = None
+    vision_bytes: int = 0      # packed vision tower (added to embed nodes)
+    projector_bytes: int = 0   # packed multimodal projector (added to embed nodes)
+    shared_experts_per_layer: int = 0  # always-active shared experts in each MoE layer
+
+    @property
+    def moe_layer_count(self) -> int:
+        dense = set(self.dense_layer_idxs or [])
+        return self.n_layers - len(dense.intersection(range(self.n_layers)))
 
     @property
     def total_experts(self) -> int:
-        return self.n_layers * self.experts_per_layer
+        return self.moe_layer_count * self.experts_per_layer
 
 
 # Kimi K3 as characterised by AirLLM PR #316: 2.8T MXFP4 multimodal MoE,
@@ -67,6 +76,30 @@ KIMI_K3 = ModelProfile(
     embed_bytes=800 * 1024 * 1024,   # sharded across several embed nodes
     lm_head_bytes=800 * 1024 * 1024,
     dtype="mxfp4",
+)
+
+# Kimi K3 0.40B: https://huggingface.co/inference-optimization/Kimi-K3-0.40B
+# 395.6M params, 8 hidden layers (layer 0 is dense, layers 1-7 are MoE),
+# 8 routed experts per MoE layer, top-2 routing, latent-space experts (512-dim).
+# Byte counts are MXFP4 packed estimates from the safetensors checkpoint.
+_K3_040B_EXPERT_PARAMS = 393_216
+_K3_040B_BLOCK = 32
+KIMI_K3_040B = ModelProfile(
+    name="kimi-k3-0.40b",
+    n_layers=8,
+    experts_per_layer=8,
+    top_k=2,
+    hidden_size=1024,
+    expert_bytes=(_K3_040B_EXPERT_PARAMS // 2)          # packed 4-bit weights
+                 + (_K3_040B_EXPERT_PARAMS // _K3_040B_BLOCK),  # E8M0 block scales
+    resident_bytes_per_layer=4_069_821,                  # max non-expert layer (dense layer 0)
+    embed_bytes=89_128_960,                              # embed_tokens (packed)
+    lm_head_bytes=89_128_960,                            # lm_head (packed)
+    dtype="mxfp4",
+    dense_layer_idxs=[0],
+    vision_bytes=2_587_400,                              # vision_tower (packed)
+    projector_bytes=1_114_656,                           # mm_projector (packed)
+    shared_experts_per_layer=1,
 )
 
 
@@ -95,6 +128,7 @@ class ClusterPlan:
     experts_per_node: int = 1                # placement choice (design = 1)
     capacity_experts_per_node: int = 1       # how many could fit at capacity
     rsx: bool = False
+    moe_layers: int = 0
     warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
@@ -125,6 +159,8 @@ def plan_cluster(model: ModelProfile,
     """
     usable_bytes = usable_ram_mb * 1024 * 1024
     warnings: List[str] = []
+    moe_count = model.moe_layer_count
+    total_experts = moe_count * model.experts_per_layer
 
     # Hot capacity per node: XDR only under OtherOS; XDR + RSX under GameOS.
     node_capacity_bytes = usable_bytes
@@ -154,13 +190,13 @@ def plan_cluster(model: ModelProfile,
         experts_per_node = capacity_experts_per_node
 
     if expert_split > 1:
-        expert_nodes = model.total_experts * expert_split
+        expert_nodes = total_experts * expert_split
     else:
-        expert_nodes = (model.total_experts + experts_per_node - 1) // experts_per_node
+        expert_nodes = (total_experts + experts_per_node - 1) // experts_per_node
         if experts_per_node > 1:
             warnings.append(
                 f"packing {experts_per_node} experts/node -> "
-                f"{expert_nodes:,} expert nodes (vs {model.total_experts:,} at 1/node)")
+                f"{expert_nodes:,} expert nodes (vs {total_experts:,} at 1/node)")
     layer_nodes = model.n_layers  # one coordinator per layer holds resident modules
 
     if model.resident_bytes_per_layer > usable_bytes:
@@ -168,17 +204,19 @@ def plan_cluster(model: ModelProfile,
             f"per-layer resident modules ({model.resident_bytes_per_layer/2**20:.1f} MB) "
             f"exceed a node; layer coordinators must shard too")
 
-    embed_nodes = _split_factor(model.embed_bytes, usable_bytes)
+    input_bytes = model.embed_bytes + model.vision_bytes + model.projector_bytes
+    embed_nodes = _split_factor(input_bytes, usable_bytes)
     lm_head_nodes = _split_factor(model.lm_head_bytes, usable_bytes)
     io_nodes = embed_nodes + lm_head_nodes
 
     total = expert_nodes + layer_nodes + io_nodes
 
-    # Per token: top_k experts per layer light up, plus each layer coordinator,
-    # plus the embed + lm_head shards. With experts packed together, the number
-    # of distinct nodes touched can be lower (co-resident experts), but bound it
-    # simply by the activations dispatched.
-    active = (model.top_k * expert_split * model.n_layers
+    # Per token: top_k routed experts per MoE layer light up, plus every layer
+    # coordinator, plus the embed + lm_head shards. Dense layers add no routed
+    # expert nodes. With experts packed together, the number of distinct nodes
+    # touched can be lower (co-resident experts), but bound it simply by the
+    # activations dispatched.
+    active = (model.top_k * expert_split * moe_count
               + layer_nodes + io_nodes)
     idle_fraction = 1.0 - (active / total) if total else 0.0
 
@@ -197,6 +235,7 @@ def plan_cluster(model: ModelProfile,
         experts_per_node=experts_per_node,
         capacity_experts_per_node=capacity_experts_per_node,
         rsx=rsx,
+        moe_layers=moe_count,
         warnings=warnings,
     )
 
@@ -206,11 +245,14 @@ def placement_table(model: ModelProfile,
     """Enumerate node assignments. Large for K3 (~82k rows) -- use for small
     profiles / slices; ``plan_cluster`` gives the summary for the full farm."""
     usable_mb = usable_ram_mb
+    dense = set(model.dense_layer_idxs or [])
     nodes: List[NodeSpec] = []
     for layer in range(model.n_layers):
         nodes.append(NodeSpec("layer", layer, None,
                               model.resident_bytes_per_layer / 2**20,
                               model.resident_bytes_per_layer / 2**20 <= usable_mb))
+        if layer in dense:
+            continue
         for e in range(model.experts_per_layer):
             mb = model.expert_bytes / 2**20
             nodes.append(NodeSpec("expert", layer, e, mb, mb <= usable_mb))

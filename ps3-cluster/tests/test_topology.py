@@ -82,6 +82,44 @@ class TestTopology(unittest.TestCase):
         self.assertEqual(len(layers), 2)
         self.assertTrue(all(n.fits for n in table))
 
+    def test_k3_040b_total_experts(self):
+        # Layer 0 is dense; layers 1-7 each hold 8 routed experts.
+        self.assertEqual(T.KIMI_K3_040B.moe_layer_count, 7)
+        self.assertEqual(T.KIMI_K3_040B.total_experts, 7 * 8)
+        self.assertEqual(T.KIMI_K3_040B.total_experts, 56)
+
+    def test_k3_040b_expert_fits_one_node(self):
+        plan = T.plan_cluster(T.KIMI_K3_040B)
+        self.assertEqual(plan.experts_split_across, 1)
+        self.assertLessEqual(plan.per_expert_mb, T.PS3_USABLE_RAM_MB)
+        self.assertGreater(plan.capacity_experts_per_node, 1)
+
+    def test_k3_040b_default_one_expert_per_node(self):
+        plan = T.plan_cluster(T.KIMI_K3_040B)
+        self.assertEqual(plan.experts_per_node, 1)
+        self.assertEqual(plan.expert_nodes, 56)
+        self.assertEqual(plan.layer_nodes, 8)
+        self.assertEqual(plan.io_nodes, 2)
+        self.assertEqual(plan.total_nodes, 56 + 8 + 2)
+
+    def test_k3_040b_is_not_densely_idle(self):
+        # 0.40B is small enough that each token lights up a meaningful fraction.
+        plan = T.plan_cluster(T.KIMI_K3_040B)
+        # top-2 * 7 MoE layers = 14 routed experts; + 8 layer + 2 I/O = 24 active.
+        self.assertEqual(plan.active_nodes_per_token, 2 * 7 + 8 + 2)
+        self.assertEqual(plan.active_nodes_per_token, 24)
+        self.assertEqual(plan.idle_fraction, 1.0 - 24 / plan.total_nodes)
+
+    def test_k3_040b_placement_table_skips_dense_layer(self):
+        table = T.placement_table(T.KIMI_K3_040B)
+        experts = [n for n in table if n.role == "expert"]
+        layers = [n for n in table if n.role == "layer"]
+        self.assertEqual(len(experts), 56)
+        self.assertEqual(len(layers), 8)
+        self.assertTrue(all(n.fits for n in table))
+        # No experts assigned to dense layer 0.
+        self.assertFalse(any(n.layer == 0 and n.role == "expert" for n in table))
+
 
 if __name__ == "__main__":
     unittest.main()
