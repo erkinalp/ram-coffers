@@ -8,6 +8,7 @@ from ps3_cluster import topology as T
 
 
 class TestTopology(unittest.TestCase):
+
     def test_k3_total_experts(self):
         self.assertEqual(T.KIMI_K3.total_experts, 92 * 896)
         self.assertEqual(T.KIMI_K3.total_experts, 82432)
@@ -22,7 +23,7 @@ class TestTopology(unittest.TestCase):
         plan = T.plan_cluster(T.KIMI_K3)
         self.assertEqual(plan.experts_per_node, 1)
         self.assertEqual(plan.expert_nodes, 82432)
-        self.assertGreater(plan.capacity_experts_per_node, 1)  # 200MB/19MB
+        self.assertGreater(plan.capacity_experts_per_node, 1)  # 200MB XDR/19MB
 
     def test_rsx_widens_capacity_but_not_default_placement(self):
         # RSX (GameOS exploit) adds hot capacity; placement still 1/node unless asked.
@@ -67,7 +68,7 @@ class TestTopology(unittest.TestCase):
             embed_bytes=100 * 1024 * 1024, lm_head_bytes=100 * 1024 * 1024)
         plan = T.plan_cluster(big)
         self.assertGreater(plan.experts_split_across, 1)
-        self.assertTrue(any("exceeds a node" in w for w in plan.warnings))
+        self.assertTrue(any("exceeds the" in w and "largest pool" in w for w in plan.warnings))
 
     def test_placement_table_small(self):
         small = T.ModelProfile(
@@ -119,6 +120,71 @@ class TestTopology(unittest.TestCase):
         self.assertTrue(all(n.fits for n in table))
         # No experts assigned to dense layer 0.
         self.assertFalse(any(n.layer == 0 and n.role == "expert" for n in table))
+
+    def test_deepseek_v4_flash_total_experts(self):
+        self.assertEqual(T.DEEPSEEK_V4_FLASH.total_experts, 43 * 256)
+        self.assertEqual(T.DEEPSEEK_V4_FLASH.total_experts, 11008)
+
+    def test_deepseek_v4_flash_expert_fits_one_node(self):
+        plan = T.plan_cluster(T.DEEPSEEK_V4_FLASH)
+        self.assertEqual(plan.experts_split_across, 1)
+        self.assertLessEqual(plan.per_expert_mb, T.PS3_USABLE_RAM_MB)
+        self.assertGreater(plan.capacity_experts_per_node, 1)
+
+    def test_deepseek_v4_flash_default_plan(self):
+        plan = T.plan_cluster(T.DEEPSEEK_V4_FLASH)
+        self.assertEqual(plan.experts_per_node, 1)
+        self.assertEqual(plan.expert_nodes, 11008)
+        self.assertEqual(plan.layer_nodes, 43)
+        # 1010 MB embed/lm-head -> 6 XDR nodes each.
+        self.assertEqual(plan.io_nodes, 12)
+        self.assertEqual(plan.total_nodes, 11008 + 43 + 12)
+
+    def test_deepseek_v4_flash_plan_with_rsx(self):
+        plan = T.plan_cluster(T.DEEPSEEK_V4_FLASH, rsx=True)
+        # Layer resident modules fit in the combined 440 MB, no warning.
+        self.assertFalse(any("resident" in w for w in plan.warnings))
+        # Embed/lm-head fit in 3 nodes each (1010/440 -> 3).
+        self.assertEqual(plan.io_nodes, 6)
+        # XDR fills first, so the default 1 expert/node is still XDR-only.
+        self.assertEqual(plan.xdr_experts_per_node, 1)
+        self.assertEqual(plan.rsx_experts_per_node, 0)
+
+    def test_deepseek_v4_pro_total_experts(self):
+        self.assertEqual(T.DEEPSEEK_V4_PRO.total_experts, 61 * 384)
+        self.assertEqual(T.DEEPSEEK_V4_PRO.total_experts, 23424)
+
+    def test_deepseek_v4_pro_expert_fits_one_node(self):
+        plan = T.plan_cluster(T.DEEPSEEK_V4_PRO)
+        self.assertEqual(plan.experts_split_across, 1)
+        self.assertLessEqual(plan.per_expert_mb, T.PS3_USABLE_RAM_MB)
+        self.assertGreater(plan.capacity_experts_per_node, 1)
+
+    def test_deepseek_v4_pro_default_plan(self):
+        plan = T.plan_cluster(T.DEEPSEEK_V4_PRO)
+        self.assertEqual(plan.experts_per_node, 1)
+        self.assertEqual(plan.expert_nodes, 23424)
+        self.assertEqual(plan.layer_nodes, 61)
+        # Per-layer resident modules exceed 200 MB -> planner warns.
+        self.assertTrue(any("resident" in w for w in plan.warnings))
+
+    def test_deepseek_v4_pro_plan_with_rsx(self):
+        plan = T.plan_cluster(T.DEEPSEEK_V4_PRO, rsx=True)
+        # Combined 440 MB still less than ~413 MB layer? Actually 413 < 440.
+        self.assertFalse(any("resident" in w for w in plan.warnings))
+        # Embed/lm-head ~1767 MB -> 5 nodes each with combined 440 MB.
+        self.assertEqual(plan.io_nodes, 10)
+        self.assertEqual(plan.xdr_experts_per_node, 1)
+        self.assertEqual(plan.rsx_experts_per_node, 0)
+
+    def test_rsx_hybrid_packing_fills_xdr_then_rsx(self):
+        # With K3 and 15 experts/node, XDR holds 10, RSX holds 5.
+        plan = T.plan_cluster(T.KIMI_K3, rsx=True, experts_per_node=15)
+        self.assertEqual(plan.experts_per_node, 15)
+        self.assertEqual(plan.xdr_experts_per_node, 10)
+        self.assertEqual(plan.rsx_experts_per_node, 5)
+        self.assertEqual(plan.xdr_capacity_experts_per_node, 10)
+        self.assertEqual(plan.rsx_capacity_experts_per_node, 12)
 
 
 if __name__ == "__main__":
