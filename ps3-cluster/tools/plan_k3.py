@@ -12,6 +12,8 @@ from ps3_cluster import topology as T
 PROFILES = {
     "kimi-k3": T.KIMI_K3,
     "kimi-k3-0.40b": T.KIMI_K3_040B,
+    "deepseek-v4-flash": T.DEEPSEEK_V4_FLASH,
+    "deepseek-v4-pro": T.DEEPSEEK_V4_PRO,
 }
 
 
@@ -38,9 +40,14 @@ def main():
     print(f"  boot path            : {boot}")
     print("=" * 56)
     print(f"  hot RAM/node         : {plan.node_capacity_mb:.0f} MB")
+    if plan.rsx:
+        print(f"    XDR capacity       : {plan.xdr_capacity_mb:.0f} MB  ({plan.xdr_capacity_experts_per_node} experts)")
+        print(f"    RSX capacity       : {plan.rsx_capacity_mb:.0f} MB  ({plan.rsx_capacity_experts_per_node} experts)")
     print(f"  moe layers           : {plan.moe_layers}")
-    print(f"  per-expert (MXFP4)   : {plan.per_expert_mb:.1f} MB")
+    print(f"  per-expert (FP4)     : {plan.per_expert_mb:.1f} MB")
     print(f"  experts fit / node   : {plan.capacity_experts_per_node}")
+    if plan.experts_per_node > 1:
+        print(f"  packed split / node  : {plan.xdr_experts_per_node} XDR + {plan.rsx_experts_per_node} RSX")
     print(f"  expert nodes         : {plan.expert_nodes:,}")
     print(f"  layer-coordinator    : {plan.layer_nodes:,}")
     print(f"  embed/lm_head nodes  : {plan.io_nodes:,}")
