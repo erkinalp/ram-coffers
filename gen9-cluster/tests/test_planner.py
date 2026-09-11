@@ -4,7 +4,8 @@ import dataclasses
 import unittest
 
 from gen9_cluster.hardware import GB, ConsoleUnit, Downbin, Runtime
-from gen9_cluster.model import DEEPSEEK_TINY, DEEPSEEK_V4_PRO
+from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V4_1_FLASH,
+                                DEEPSEEK_V4_PRO)
 from gen9_cluster.planner import PlanningError, describe_plan, plan_split
 
 #: A hypothetical unpublished model, for the paths that have to keep warning
@@ -126,6 +127,38 @@ class TestPlacement(unittest.TestCase):
             self.assertEqual(sorted(host.hot_layers + host.dense_layers),
                              sorted(stage.layers))
             self.assertGreater(host.kv_bytes, 0)
+
+    def test_engram_tables_sit_on_their_stage_host_nvme(self):
+        """CSA2's conditional-memory tables are NVMe residents by design, and
+        they belong to the shelf whose host runs their layer — a lookup must
+        not cross a shelf boundary ahead of the layer that needs it."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60))
+        host_by_layer = {}
+        for stage in plan.stages:
+            for layer in stage.layers:
+                host_by_layer[layer] = stage.host_unit
+        for layer in DEEPSEEK_V4_1_FLASH.engram.layer_ids:
+            host = plan.units[host_by_layer[layer]]
+            self.assertIn(f"engram-{layer}@ssd", host.io_pieces)
+
+    def test_decoder_stage_hosts_hold_little_growing_cache(self):
+        """Only the source layers' hosts see a cache that grows with context —
+        a host of pure Reuse layers is almost cache-free, which is the CED
+        split's whole residency consequence."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60),
+                          context_tokens=1_000_000)
+        attention = DEEPSEEK_V4_1_FLASH.attention
+        sources = (set(attention.kv_source_layers)
+                   | set(attention.index_source_layers))
+        source_hosts = {stage.host_unit for stage in plan.stages
+                        if any(layer in sources for layer in stage.layers)}
+        for stage in plan.stages:
+            host = plan.units[stage.host_unit]
+            if stage.host_unit in source_hosts:
+                # ~36 B/token for a decoder index stream, ~144 B for a main one
+                self.assertGreater(host.kv_bytes, 50 * 1024 * 1024)
+            else:
+                self.assertLess(host.kv_bytes, 10 * 1024 * 1024)
 
     def test_a_devmode_xbox_is_not_asked_to_hold_more_than_its_sandbox(self):
         fleet = ps5_fleet(3) + [ConsoleUnit("xsx-dev", "xbox-series-x",

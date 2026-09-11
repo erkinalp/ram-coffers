@@ -298,7 +298,7 @@ def plan_split(profile: ModelProfile, fleet: Sequence[ConsoleUnit], *,
                                   context_tokens, warnings)
     shortfall = _assign_experts(profile, caps, units, stages, allow_ssd_tier,
                                 warnings)
-    _assign_io(profile, caps, units, warnings)
+    shortfall += _assign_io(profile, caps, units, stages, warnings)
 
     if shortfall > 0:
         raise PlanningError(
@@ -311,8 +311,9 @@ def plan_split(profile: ModelProfile, fleet: Sequence[ConsoleUnit], *,
     ssd_bytes = sum(u.ssd_expert_bytes for u in units.values())
     if ssd_bytes:
         warnings.append(
-            f"{ssd_bytes / GB:.1f} GiB of routed experts live on NVMe and are "
-            f"streamed on a routing hit; where that happens the layer is bound "
+            f"{ssd_bytes / GB:.1f} GiB of weights live on NVMe — routed "
+            f"experts streamed on a routing hit, Engram tables and any spilled "
+            f"io pieces read on demand; where that happens the block is bound "
             f"by SSD reads, not by memory bandwidth")
     return SplitPlan(
         model=profile.name, model_assumed=profile.assumed,
@@ -501,7 +502,6 @@ def _assign_experts(profile: ModelProfile,
 
     Returns bytes that could not be placed anywhere (0 when the plan fits).
     """
-    expert = profile.expert_bytes()
     all_units = sorted(units)
     shortfall = 0
     cross_shelf = 0
@@ -511,9 +511,11 @@ def _assign_experts(profile: ModelProfile,
         for layer in stage.layers:
             if not _has_routed_experts(profile, layer):
                 continue
-            remaining = profile.moe.n_routed_experts
+            moe = profile.moe_for_block(layer)
+            expert = profile.expert_bytes(layer)
+            remaining = moe.n_routed_experts
             first = 0
-            shares = _shelf_shares(profile, shelf, units)
+            shares = _shelf_shares(profile, shelf, units, moe)
             for uid in sorted(shelf, key=lambda u: (-units[u].headroom_bytes, u)):
                 if remaining <= 0:
                     break
@@ -571,13 +573,13 @@ def _assign_experts(profile: ModelProfile,
 
 
 def _shelf_shares(profile: ModelProfile, shelf: Sequence[str],
-                  units: Dict[str, UnitPlan]) -> Dict[str, int]:
+                  units: Dict[str, UnitPlan], moe) -> Dict[str, int]:
     """How many of a layer's experts each shelf member should take."""
     total = sum(max(units[uid].gemv_gflops, 1.0) for uid in shelf)
     shares: Dict[str, int] = {}
     for uid in shelf:
         fraction = max(units[uid].gemv_gflops, 1.0) / total
-        shares[uid] = max(1, int(round(profile.moe.n_routed_experts * fraction)))
+        shares[uid] = max(1, int(round(moe.n_routed_experts * fraction)))
     return shares
 
 
@@ -622,16 +624,27 @@ def _place_on_ssd(layer: int, first: int, count: int, expert_bytes: int,
 
 
 def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
-               units: Dict[str, UnitPlan], warnings: List[str]) -> None:
-    """Place the embedding, the LM head, and any MTP heads.
+               units: Dict[str, UnitPlan], stages: Sequence[StagePlan],
+               warnings: List[str]) -> int:
+    """Returns bytes that fit in no unit's allowed storage (0 on success)."""
+    """Place the embedding, the LM head, the vision tower, and Engram tables.
 
     Both ends of the model are read once per token and are large (~2 GiB each at
     V4-Pro width in bf16, since the vocabulary tables are not FP8), so they go
-    wherever there is room, preferring the units that already host the first and
-    last layers so the token starts and ends where it is embedded.
+    wherever there is room. The vision tower joins them: once per image rather
+    than once per token, but still small enough to hold in RAM.
+
+    Engram tables are different: tens of GiB each, hash-addressed, and read a
+    few kilobytes per token, so they are NVMe residents *by design* — the
+    Engram paper's whole point is deterministic addressing that tolerates host
+    memory. Each table goes to the SSD of the shelf host that owns its layer,
+    so the lookup never crosses a shelf boundary ahead of the layer that needs
+    it.
     """
     pieces = [("embedding", profile.embedding_bytes()),
               ("lm_head", profile.lm_head_bytes())]
+    if profile.vision is not None:
+        pieces.append(("vision-encoder", profile.vision_bytes()))
     for name, size in pieces:
         target = max(units.values(),
                      key=lambda p: (p.headroom_bytes, p.unit_id))
@@ -645,6 +658,38 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
             continue
         target.io_pieces.append(name)
         target.hot_bytes += size
+
+    unplaced = 0
+    if profile.engram is not None:
+        host_by_layer: Dict[int, str] = {}
+        for stage in stages:
+            for layer in stage.layers:
+                host_by_layer[layer] = stage.host_unit
+
+        def ssd_room(uid: str) -> int:
+            return (caps[uid].storage.capacity_bytes // 2
+                    - units[uid].ssd_expert_bytes)
+
+        for table, layer_id in enumerate(profile.engram.layer_ids):
+            size = profile.engram.table_bytes(table, profile.hidden_size,
+                                              profile.weights)
+            target_id = host_by_layer.get(layer_id)
+            if target_id is not None and ssd_room(target_id) < size:
+                warnings.append(
+                    f"engram table at layer {layer_id} ({size / GB:.1f} GiB) "
+                    f"does not fit on its stage host's NVMe; looking across "
+                    f"the fleet, so lookups pay a cross-shelf hop")
+                target_id = None
+            if target_id is None:
+                fits = [uid for uid in units if ssd_room(uid) >= size]
+                if not fits:
+                    unplaced += size
+                    continue
+                target_id = max(fits, key=lambda uid: (ssd_room(uid), uid))
+            target = units[target_id]
+            target.ssd_expert_bytes += size
+            target.io_pieces.append(f"engram-{layer_id}@ssd")
+    return unplaced
 
 
 # -- cost model ------------------------------------------------------------
@@ -668,9 +713,6 @@ def _estimate_decode(profile: ModelProfile,
     is what makes a wider shelf faster: the same top-k work spread over more
     readers.
     """
-    expert_bytes = profile.expert_bytes()
-    top_k = profile.moe.top_k
-    n_routed = profile.moe.n_routed_experts
     total = 0.0
     active_per_layer: List[float] = []
 
@@ -683,6 +725,10 @@ def _estimate_decode(profile: ModelProfile,
     for stage in stages:
         host_cap = caps[stage.host_unit]
         for layer in stage.layers:
+            moe = profile.moe_for_block(layer)
+            expert_bytes = profile.expert_bytes(layer)
+            top_k = moe.top_k
+            n_routed = moe.n_routed_experts
             # Under CSA the cache a layer *reads* is a small selection of the
             # cache it holds, so the read is what decode costs, not residency.
             kv_read = profile.block_kv_read_bytes(layer, context_tokens)

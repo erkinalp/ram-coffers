@@ -129,6 +129,35 @@ built from many small consoles: 300 Series S units would be 14 shelves and the
 hops start to matter. It is also the reason the eventual PS6 answer is *fewer,
 larger* nodes rather than more of these.
 
+## What V4.1 changes
+
+V4.1-Flash is a different architecture, and the split moves again rather than
+just rescaling.
+
+- **The KV cache concentrates.** V4 spread a compressed stream over every
+  layer's host; CSA2 keeps a handful of shared pools — four main-KV streams
+  and eight indexer streams, all FP4 at `m=2` — so the only hosts whose cache
+  grows are the ones owning a source layer (2, 8, 14, 20 for main KV, plus 24,
+  28, 32, 36 for the decoder's index). Every other shelf host carries its
+  sliding-window state and nothing more: a decoder-stage host is suddenly a
+  far easier placement. The whole model's growing cache is 864 B/token
+  derived against the card's ~890, a quarter of V4-Flash's, and the decoder's
+  Reindex scans are capped at a 2048-block candidate pool regardless of
+  context length.
+- **Engram goes straight to NVMe.** Two ~98 B-parameter tables live at layers
+  1 and 14, hash-addressed and read a few kilobytes per token — the Engram
+  design's point is that deterministic addressing tolerates host memory, and
+  here that means the owning stage host's SSD. At ~92 GiB each they would
+  crowd out several consoles' worth of RAM for a lookup that never needs it.
+- **Draft blocks are a different MoE.** The three DSpark blocks place like
+  layers but route to 128 experts at top-3 with a Markov-rank projection; the
+  planner sizes their hot and cold sides by the draft config, not the
+  backbone's 384/top-6.
+
+The floor drops from 73 PS5s (V4 Pro) to 27 — but note the floor now leans on
+NVMe by design: 183 GiB of Engram plus any expert spill means a minimum fleet
+streams more than it holds.
+
 ## Why the planner warns instead of refusing
 
 A slow plan is still a plan. Warnings cover: assumed model configuration,
