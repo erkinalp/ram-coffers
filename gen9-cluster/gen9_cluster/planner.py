@@ -121,6 +121,9 @@ class UnitPlan:
     fast_expert_bytes: int = 0
     slow_expert_bytes: int = 0
     ssd_expert_bytes: int = 0
+    #: Engram row bytes held in RAM (layer -> bytes) — the --no-ssd fallback,
+    #: where a table shards across the fleet like a read-mostly expert.
+    engram_rows: Dict[int, int] = field(default_factory=dict)
     kv_bytes: int = 0
     capacity_bytes: int = 0
     fast_capacity_bytes: int = 0
@@ -131,7 +134,7 @@ class UnitPlan:
     def resident_bytes(self) -> int:
         """Bytes held in RAM (the SSD tier is not resident)."""
         return (self.hot_bytes + self.fast_expert_bytes + self.slow_expert_bytes
-                + self.kv_bytes)
+                + sum(self.engram_rows.values()) + self.kv_bytes)
 
     @property
     def n_experts(self) -> int:
@@ -152,6 +155,7 @@ class UnitPlan:
             "fast_expert_bytes": self.fast_expert_bytes,
             "slow_expert_bytes": self.slow_expert_bytes,
             "ssd_expert_bytes": self.ssd_expert_bytes,
+            "engram_ram_bytes": sum(self.engram_rows.values()),
             "kv_bytes": self.kv_bytes,
             "resident_bytes": self.resident_bytes,
             "capacity_bytes": self.capacity_bytes,
@@ -267,11 +271,9 @@ def plan_split(profile: ModelProfile, fleet: Sequence[ConsoleUnit], *,
     wired as subclusters of 22 behind a head node rather than as one flat farm.
 
     Raises :class:`PlanningError` only when the fleet cannot host the model
-    in the tiers it was allowed to use (so ``allow_ssd_tier=False`` makes a
-    model like V4.1, whose Engram tables are NVMe residents, infeasible
-    outright): a fleet that is merely *slow* gets a plan and a warning,
-    because "this works, at 0.4 tokens/s" is a useful answer and refusing to
-    plan is not.
+    in the tiers it was allowed to use: a fleet that is merely *slow* gets a
+    plan and a warning, because "this works, at 0.4 tokens/s" is a useful
+    answer and refusing to plan is not.
     """
     if not fleet:
         raise PlanningError("empty fleet")
@@ -646,10 +648,11 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
     token, so it sits in the stage host's RAM.
 
     Returns bytes that fit in no unit's allowed storage (0 on success). When
-    ``allow_ssd_tier`` is false every SSD-resident piece — Engram row stores
-    and any RAM-overflowing io piece — counts toward the shortfall instead:
-    the flag is a storage constraint, not a preference, and a plan that
-    quietly used NVMe anyway would lie about being RAM-only.
+    ``allow_ssd_tier`` is false, Engram row stores shard across fleet RAM
+    instead (hash addressing means any unit can hold any slice) and a
+    RAM-overflowing io piece counts toward the shortfall: the flag is a
+    storage constraint, not a preference, and a plan that quietly used NVMe
+    anyway would lie about being RAM-only.
     """
     unplaced = 0
     preferred: Dict[str, str] = {}
@@ -693,6 +696,11 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
             return (caps[uid].storage.capacity_bytes // 2
                     - units[uid].ssd_expert_bytes)
 
+        shelf_by_layer: Dict[int, StagePlan] = {}
+        for stage in stages:
+            for layer in stage.layers:
+                shelf_by_layer[layer] = stage
+
         for table, layer_id in enumerate(profile.engram.layer_ids):
             host = host_by_layer.get(layer_id)
             fuse = profile.engram.fusion_bytes(profile.hidden_size,
@@ -718,7 +726,12 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
 
             rows = profile.engram.table_row_bytes(table, profile.weights)
             if not allow_ssd_tier:
-                unplaced += rows
+                # No NVMe to lean on: the row store shards across fleet RAM
+                # instead — deterministic addressing means a lookup can route
+                # to whichever units hold the rows it needs.
+                unplaced += _place_engram_ram(
+                    layer_id, rows, shelf_by_layer[layer_id].expert_units,
+                    units, warnings)
                 continue
             target_id = host
             if target_id is not None and ssd_room(target_id) < rows:
@@ -737,6 +750,53 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
             target.ssd_expert_bytes += rows
             target.io_pieces.append(f"engram-{layer_id}@ssd")
     return unplaced
+
+
+def _place_engram_ram(layer_id: int, rows: int, shelf: Sequence[str],
+                      units: Dict[str, UnitPlan],
+                      warnings: List[str]) -> int:
+    """Shard a table's row store across RAM — the ``--no-ssd`` path.
+
+    Engram addressing is a hash of the token's n-grams, so the rows a lookup
+    needs are scattered uniformly no matter how the store is cut; sharding is
+    therefore free in exactly one direction that matters — any unit can hold
+    any slice — and costly in the other: every token's lookup gathers from
+    each holder over the network. Rows fill the table's own shelf first (one
+    switch away from the fusion projection), then the roomiest fleet members.
+    """
+    remaining = rows
+    ordered = sorted(shelf, key=lambda u: (-units[u].headroom_bytes, u))
+    for uid in ordered:
+        if remaining <= 0:
+            break
+        take = min(remaining, units[uid].headroom_bytes)
+        if take <= 0:
+            continue
+        units[uid].engram_rows[layer_id] = take
+        units[uid].io_pieces.append(f"engram-{layer_id}-rows")
+        remaining -= take
+    if remaining > 0:
+        outside = sorted((u for u in units if u not in shelf),
+                         key=lambda u: (-units[u].headroom_bytes, u))
+        for uid in outside:
+            if remaining <= 0:
+                break
+            take = min(remaining, units[uid].headroom_bytes)
+            if take <= 0:
+                continue
+            units[uid].engram_rows[layer_id] = take
+            units[uid].io_pieces.append(f"engram-{layer_id}-rows")
+            remaining -= take
+        if remaining < rows:
+            warnings.append(
+                f"engram table at layer {layer_id} is sharded beyond its own "
+                f"shelf; every lookup gathers from those units over the "
+                f"network")
+    if remaining > 0:
+        warnings.append(
+            f"engram table at layer {layer_id} needs {rows / GB:.1f} GiB of "
+            f"RAM with no NVMe to use; {remaining / GB:.1f} GiB found nowhere")
+    return remaining
 
 
 # -- cost model ------------------------------------------------------------
@@ -808,8 +868,8 @@ def _estimate_decode(profile: ModelProfile,
             if (profile.engram is not None
                     and layer in profile.engram.layer_ids):
                 # The lookup is serial with the layer that consumes it: row
-                # reads off the holder's NVMe, then the fusion projection off
-                # the stage host's RAM.
+                # reads off wherever the store landed, then the fusion
+                # projection off the stage host's RAM.
                 holder = engram_holder.get(layer)
                 worst = max(worst, _read_seconds(
                     host_cap,
@@ -823,6 +883,25 @@ def _estimate_decode(profile: ModelProfile,
                         "ssd")
                     if holder != stage.host_unit:
                         worst += 2 * hop_seconds
+                else:
+                    # RAM-sharded store: the token's rows are spread uniformly
+                    # over the holders, each answering its share in parallel,
+                    # and any holder outside the stage adds the gather hop.
+                    shares = [(uid, units[uid].engram_rows[layer])
+                              for uid in units
+                              if layer in units[uid].engram_rows]
+                    held = sum(share for _, share in shares)
+                    if held:
+                        remote_rows = False
+                        for uid, share in shares:
+                            part = (profile.engram.read_bytes_per_token(
+                                profile.weights) * share / held)
+                            worst = max(worst,
+                                        _read_seconds(caps[uid], part, "slow"))
+                            remote_rows = (remote_rows
+                                           or uid != stage.host_unit)
+                        if remote_rows:
+                            worst += 2 * hop_seconds
             total += worst
             active_per_layer.append(touched)
 

@@ -150,16 +150,17 @@ just rescaling.
   here that means the owning stage host's SSD. At ~92 GiB each the row stores
   would crowd out several consoles' worth of RAM for a lookup that never needs
   it; only the small fusion projection (read every token) takes stage-host
-  RAM.
+  RAM. Under `--no-ssd` the row stores shard across fleet RAM instead — hash
+  addressing means any unit can hold any slice, at the price of a network
+  gather on every lookup.
 - **Draft blocks are a different MoE.** The three DSpark blocks place like
   layers but route to 128 experts at top-3 with a Markov-rank projection; the
   planner sizes their hot and cold sides by the draft config, not the
   backbone's 384/top-6.
 
-V4.1 has no RAM-only floor at all: the Engram row stores are NVMe residents
-by design, so `--no-ssd` planning fails at any fleet size — that constraint is
-a property of the request, not a hint. With the SSD tier on, the floor is **24
-PS5s**, one more than V4 Pro's 23 (V4 Pro's own RAM-only floor is 83).
+The floor drops from 83 PS5s (V4 Pro, RAM-only) to **43** — the ~183 GiB of
+Engram rows shard across fleet RAM when no drives are allowed — and to **24**
+with the SSD tier on, one more than V4 Pro's 23.
 
 ## Why the planner warns instead of refusing
 
@@ -183,7 +184,7 @@ context).
 ## Status of every number here
 
 **Measured on the x86-64 build host** (not a console): CPU kernel 67 GFLOP/s /
-134 GB/s effective; SPIR-V compiles and passes `spirv-val`; 231 Python tests
+134 GB/s effective; SPIR-V compiles and passes `spirv-val`; 232 Python tests
 pass.
 
 **Estimated**: all console throughput. Datasheet bandwidth, derated, plus hop

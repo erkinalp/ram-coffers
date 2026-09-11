@@ -143,12 +143,25 @@ class TestPlacement(unittest.TestCase):
             # ...while the every-token fusion projection sits in its RAM
             self.assertIn(f"engram-{layer}-fuse", host.io_pieces)
 
-    def test_a_no_ssd_plan_cannot_hold_v41(self):
-        """--no-ssd is a storage constraint, not a preference: V4.1's Engram
-        row stores are NVMe residents, so a RAM-only plan is infeasible no
-        matter how large the fleet."""
+    def test_a_no_ssd_plan_shards_engram_across_ram(self):
+        """With no drive to use, a hash-addressed table can still live in the
+        fleet's RAM — split across units exactly like routed experts are."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(160),
+                          allow_ssd_tier=False)
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        quant = DEEPSEEK_V4_1_FLASH.weights
+        for table, layer in enumerate(engram.layer_ids):
+            want = engram.table_row_bytes(table, quant)
+            held = sum(u.engram_rows.get(layer, 0) for u in plan.units.values())
+            self.assertEqual(held, want)
+            self.assertFalse(any(f"engram-{layer}@ssd" in u.io_pieces
+                                 for u in plan.units.values()))
+
+    def test_a_tiny_no_ssd_fleet_still_cannot_hold_v41(self):
+        """Sharding needs RAM to shard into — a fleet without the ~183 GiB of
+        headroom the tables need refuses rather than drop rows."""
         with self.assertRaises(PlanningError):
-            plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(160),
+            plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(30),
                        allow_ssd_tier=False)
 
     def test_the_vision_tower_sits_where_images_enter(self):
