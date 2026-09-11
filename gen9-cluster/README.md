@@ -44,8 +44,8 @@ Three properties make the fleet work anyway:
    tested against each other over all 256 codes.
 
 The result is a plan, not a benchmark: **~11.1 tok/s estimated** for V4 Pro at
-8k context on 170 consoles (100 PS5 + 40 Series X + 30 BC-250), and a **73-PS5
-floor** to hold it at all. V4 Flash is a fifth of the size and fits on **20**.
+8k context on 170 consoles (100 PS5 + 40 Series X + 30 BC-250), and an **83-PS5
+floor** to hold it RAM-only. V4 Flash is a fifth of the size and fits on **22**.
 Those figures are arithmetic over memory bandwidth, network hops, and NVMe
 reads. Nothing in this repository has run on a console yet.
 
@@ -53,17 +53,18 @@ reads. Nothing in this repository has run on a console yet.
 
 | profile | params | activated | on disk | PS5s to hold it |
 |---|---|---|---|---|
-| `deepseek-v4-pro` | 1599 B | 49 B | 802 GiB | 73 |
-| `deepseek-v4-flash` | 291 B | 13 B | 148 GiB | 20 |
-| `deepseek-v4.1-flash` | 566 B + 197 B aux | 16 B (8 B prefill) | 468 GiB | 27 |
+| `deepseek-v4-pro` | 1599 B | 49 B | 802 GiB | 83 |
+| `deepseek-v4-flash` | 291 B | 13 B | 148 GiB | 22 |
+| `deepseek-v4.1-flash` | 566 B + 197 B aux | 16 B (8 B prefill) | 468 GiB | needs NVMe |
 | `deepseek-v3` | 683 B | 37 B | 638 GiB | 58 |
 | `deepseek-tiny` | — | — | 0.5 GiB | 1 (CI only) |
 
 All three V4-family profiles are the published configurations, not
 extrapolations, and the tests check them against the published parameter
 counts. V4.1's "aux" is the Engram tables and vision tower the card reports
-separately; its floor of 27 counts Engram on shelf-local NVMe, which is where
-those tables are designed to live. Two properties of the V4 architecture
+separately. Its floor has no RAM-only answer — the Engram row stores are NVMe
+residents by design, so `--no-ssd` planning fails outright — but **24 PS5s**
+suffice once the SSD tier is enabled, versus V4 Pro's 23. Two properties of the V4 architecture
 change how the planner thinks, and V4.1 adds a third row of its own below:
 
 - **Hybrid attention.** V4 alternates CSA (every 4 tokens compress to one
@@ -257,7 +258,7 @@ See [docs/GEN9_SPLITTING.md](docs/GEN9_SPLITTING.md) for the arithmetic and
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 226 tests
+python3 -m unittest discover -s tests -t .   # 231 tests
 cd kernels && make && make test              # CPU kernel + FP8 conformance
 make vulkan                                  # needs glslang-tools
 make hip                                     # needs hipcc; skipped otherwise

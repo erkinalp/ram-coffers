@@ -358,7 +358,8 @@ class CSA2Config(AttentionConfig):
     #: Blocks that append indexer keys and run their own selection.
     index_source_layers: Tuple[int, ...] = ()
     #: The first decoder layer, whose Full-mode pass builds the candidate pool
-    #: that later decoder indexers are restricted to.
+    #: that later decoder indexers are restricted to. A Reindex layer below it
+    #: has no pool yet and scans its own stream like a Full layer does.
     candidate_source_layer: int = 0
     candidate_topk_blocks: int = 0
     candidate_block_size: int = 0
@@ -450,7 +451,7 @@ class CSA2Config(AttentionConfig):
         """
         entries = context_tokens / self.csa_ratio
         if (self.kind(layer) == "reindex"
-                and layer >= self.n_encoder_layers
+                and layer >= self.candidate_source_layer
                 and self.candidate_topk_blocks):
             entries = min(entries,
                           float(self.candidate_topk_blocks
@@ -511,11 +512,20 @@ class EngramConfig:
     def total_bytes(self, hidden_size: int, quant: QuantSpec) -> int:
         return int(round(self.params(hidden_size) * quant.bytes_per_param))
 
+    def table_row_bytes(self, table: int, quant: QuantSpec) -> int:
+        """The hash-addressed row store: the NVMe-resident part of a table."""
+        return int(round(self.table_params(table) * quant.bytes_per_param))
+
+    def fusion_bytes(self, hidden_size: int, quant: QuantSpec) -> int:
+        """The per-table projection back into hidden — read every token, so
+        it belongs in the stage host's RAM, not on the drive."""
+        return int(round(hidden_size * self.n_heads * self.head_dim
+                         * quant.bytes_per_param))
+
     def table_bytes(self, table: int, hidden_size: int,
                     quant: QuantSpec) -> int:
-        params = (self.table_params(table)
-                  + hidden_size * self.n_heads * self.head_dim)
-        return int(round(params * quant.bytes_per_param))
+        return (self.table_row_bytes(table, quant)
+                + self.fusion_bytes(hidden_size, quant))
 
     def read_bytes_per_token(self, quant: QuantSpec) -> int:
         """One token's lookup: at most one row per head per n-gram size —

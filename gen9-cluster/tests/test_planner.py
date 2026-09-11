@@ -140,6 +140,34 @@ class TestPlacement(unittest.TestCase):
         for layer in DEEPSEEK_V4_1_FLASH.engram.layer_ids:
             host = plan.units[host_by_layer[layer]]
             self.assertIn(f"engram-{layer}@ssd", host.io_pieces)
+            # ...while the every-token fusion projection sits in its RAM
+            self.assertIn(f"engram-{layer}-fuse", host.io_pieces)
+
+    def test_a_no_ssd_plan_cannot_hold_v41(self):
+        """--no-ssd is a storage constraint, not a preference: V4.1's Engram
+        row stores are NVMe residents, so a RAM-only plan is infeasible no
+        matter how large the fleet."""
+        with self.assertRaises(PlanningError):
+            plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(160),
+                       allow_ssd_tier=False)
+
+    def test_the_vision_tower_sits_where_images_enter(self):
+        """The vision encoder produces embeddings consumed at the front of the
+        pipeline, so it rides the first stage's host, not wherever headroom
+        happens to be."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60))
+        first_host = plan.units[plan.stages[0].host_unit]
+        self.assertIn("vision-encoder", first_host.io_pieces)
+
+    def test_engram_reads_are_priced_into_decode(self):
+        """A plan that carries the tables is slower than the same fleet
+        without them: row lookups off NVMe plus the fusion read are part of
+        every token's cost, not free."""
+        with_tables = plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(60))
+        without = plan_split(dataclasses.replace(DEEPSEEK_V4_1_FLASH,
+                                                 engram=None), ps5_fleet(60))
+        self.assertGreater(with_tables.seconds_per_token,
+                           without.seconds_per_token)
 
     def test_decoder_stage_hosts_hold_little_growing_cache(self):
         """Only the source layers' hosts see a cache that grows with context —

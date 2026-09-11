@@ -147,16 +147,19 @@ just rescaling.
 - **Engram goes straight to NVMe.** Two ~98 B-parameter tables live at layers
   1 and 14, hash-addressed and read a few kilobytes per token — the Engram
   design's point is that deterministic addressing tolerates host memory, and
-  here that means the owning stage host's SSD. At ~92 GiB each they would
-  crowd out several consoles' worth of RAM for a lookup that never needs it.
+  here that means the owning stage host's SSD. At ~92 GiB each the row stores
+  would crowd out several consoles' worth of RAM for a lookup that never needs
+  it; only the small fusion projection (read every token) takes stage-host
+  RAM.
 - **Draft blocks are a different MoE.** The three DSpark blocks place like
   layers but route to 128 experts at top-3 with a Markov-rank projection; the
   planner sizes their hot and cold sides by the draft config, not the
   backbone's 384/top-6.
 
-The floor drops from 73 PS5s (V4 Pro) to 27 — but note the floor now leans on
-NVMe by design: 183 GiB of Engram plus any expert spill means a minimum fleet
-streams more than it holds.
+V4.1 has no RAM-only floor at all: the Engram row stores are NVMe residents
+by design, so `--no-ssd` planning fails at any fleet size — that constraint is
+a property of the request, not a hint. With the SSD tier on, the floor is **24
+PS5s**, one more than V4 Pro's 23 (V4 Pro's own RAM-only floor is 83).
 
 ## Why the planner warns instead of refusing
 
@@ -180,7 +183,7 @@ context).
 ## Status of every number here
 
 **Measured on the x86-64 build host** (not a console): CPU kernel 67 GFLOP/s /
-134 GB/s effective; SPIR-V compiles and passes `spirv-val`; 159 Python tests
+134 GB/s effective; SPIR-V compiles and passes `spirv-val`; 231 Python tests
 pass.
 
 **Estimated**: all console throughput. Datasheet bandwidth, derated, plus hop

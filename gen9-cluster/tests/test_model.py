@@ -1,5 +1,6 @@
 """Model sizing: the arithmetic that decides how many consoles are needed."""
 
+import dataclasses
 import unittest
 
 from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_1_FLASH,
@@ -280,6 +281,32 @@ class TestCSA2LayerModes(unittest.TestCase):
         reuse = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(30, 1_000_000)
         full = DEEPSEEK_V4_1_FLASH.kv_read_bytes_for_layer(2, 1_000_000)
         self.assertLess(reuse * 4, full)
+
+    def test_candidate_source_layer_gates_the_bounded_scan(self):
+        """The candidate pool exists only once the first decoder layer's Full
+        pass has built it: a Reindex layer below ``candidate_source_layer``
+        scans its own stream, so moving the boundary un-bounds the scan."""
+        attention = DEEPSEEK_V4_1_FLASH.attention
+        self.assertGreaterEqual(24, attention.candidate_source_layer)
+        shifted = dataclasses.replace(attention, candidate_source_layer=40)
+        bounded = attention.kv_read_bytes(1_000_000, layer=24)
+        unbounded = shifted.kv_read_bytes(1_000_000, layer=24)
+        self.assertGreater(unbounded, bounded * 4)
+
+    def test_engram_splits_into_nvme_rows_and_a_ram_projection(self):
+        """The planner prices the two parts of a table separately: the row
+        store (a drive resident) and the fusion projection (a RAM piece read
+        every token)."""
+        engram = DEEPSEEK_V4_1_FLASH.engram
+        for table in range(len(engram.layer_ids)):
+            whole = engram.table_bytes(table, DEEPSEEK_V4_1_FLASH.hidden_size,
+                                       DEEPSEEK_V4_1_FLASH.weights)
+            rows = engram.table_row_bytes(table, DEEPSEEK_V4_1_FLASH.weights)
+            fuse = engram.fusion_bytes(DEEPSEEK_V4_1_FLASH.hidden_size,
+                                       DEEPSEEK_V4_1_FLASH.weights)
+            self.assertEqual(rows + fuse, whole)
+            self.assertGreater(rows, 50 * GB)
+            self.assertLess(fuse, 64 * MB)
 
 
 class TestV41DraftAndAuxiliary(unittest.TestCase):

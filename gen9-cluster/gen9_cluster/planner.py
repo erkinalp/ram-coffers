@@ -266,10 +266,12 @@ def plan_split(profile: ModelProfile, fleet: Sequence[ConsoleUnit], *,
     over the whole fleet — and it is the same reason Condor's PS3 cluster was
     wired as subclusters of 22 behind a head node rather than as one flat farm.
 
-    Raises :class:`PlanningError` only when the fleet cannot host the model even
-    with the SSD tier enabled: a fleet that is merely *slow* gets a plan and a
-    warning, because "this works, at 0.4 tokens/s" is a useful answer and
-    refusing to plan is not.
+    Raises :class:`PlanningError` only when the fleet cannot host the model
+    in the tiers it was allowed to use (so ``allow_ssd_tier=False`` makes a
+    model like V4.1, whose Engram tables are NVMe residents, infeasible
+    outright): a fleet that is merely *slow* gets a plan and a warning,
+    because "this works, at 0.4 tokens/s" is a useful answer and refusing to
+    plan is not.
     """
     if not fleet:
         raise PlanningError("empty fleet")
@@ -298,7 +300,8 @@ def plan_split(profile: ModelProfile, fleet: Sequence[ConsoleUnit], *,
                                   context_tokens, warnings)
     shortfall = _assign_experts(profile, caps, units, stages, allow_ssd_tier,
                                 warnings)
-    shortfall += _assign_io(profile, caps, units, stages, warnings)
+    shortfall += _assign_io(profile, caps, units, stages, allow_ssd_tier,
+                            warnings)
 
     if shortfall > 0:
         raise PlanningError(
@@ -625,41 +628,61 @@ def _place_on_ssd(layer: int, first: int, count: int, expert_bytes: int,
 
 def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
                units: Dict[str, UnitPlan], stages: Sequence[StagePlan],
-               warnings: List[str]) -> int:
-    """Returns bytes that fit in no unit's allowed storage (0 on success)."""
+               allow_ssd_tier: bool, warnings: List[str]) -> int:
     """Place the embedding, the LM head, the vision tower, and Engram tables.
 
     Both ends of the model are read once per token and are large (~2 GiB each at
     V4-Pro width in bf16, since the vocabulary tables are not FP8), so they go
-    wherever there is room. The vision tower joins them: once per image rather
-    than once per token, but still small enough to hold in RAM.
+    wherever there is room. The vision tower joins them — on the first stage's
+    host when it fits, since that is where the embeddings an image produces
+    first land.
 
     Engram tables are different: tens of GiB each, hash-addressed, and read a
-    few kilobytes per token, so they are NVMe residents *by design* — the
-    Engram paper's whole point is deterministic addressing that tolerates host
-    memory. Each table goes to the SSD of the shelf host that owns its layer,
-    so the lookup never crosses a shelf boundary ahead of the layer that needs
-    it.
+    few kilobytes per token, so the row store is NVMe-resident *by design* —
+    the Engram paper's whole point is deterministic addressing that tolerates
+    host memory. Each row store goes to the SSD of the shelf host that owns
+    its layer, so the lookup never crosses a shelf boundary ahead of the layer
+    that needs it. The small fusion projection does the opposite: read every
+    token, so it sits in the stage host's RAM.
+
+    Returns bytes that fit in no unit's allowed storage (0 on success). When
+    ``allow_ssd_tier`` is false every SSD-resident piece — Engram row stores
+    and any RAM-overflowing io piece — counts toward the shortfall instead:
+    the flag is a storage constraint, not a preference, and a plan that
+    quietly used NVMe anyway would lie about being RAM-only.
     """
+    unplaced = 0
+    preferred: Dict[str, str] = {}
+    if stages and profile.vision is not None:
+        preferred["vision-encoder"] = stages[0].host_unit
+
     pieces = [("embedding", profile.embedding_bytes()),
               ("lm_head", profile.lm_head_bytes())]
     if profile.vision is not None:
         pieces.append(("vision-encoder", profile.vision_bytes()))
     for name, size in pieces:
-        target = max(units.values(),
-                     key=lambda p: (p.headroom_bytes, p.unit_id))
-        if target.headroom_bytes < size:
-            warnings.append(
-                f"{name} ({size / GB:.2f} GiB) does not fit in any unit's "
-                f"remaining RAM; it is placed on {target.unit_id}'s NVMe, which "
-                f"costs a streamed read once per token")
-            target.ssd_expert_bytes += size
-            target.io_pieces.append(f"{name}@ssd")
+        first_choice = preferred.get(name)
+        target = units[first_choice] if first_choice is not None else None
+        if target is None or target.headroom_bytes < size:
+            target = max(units.values(),
+                         key=lambda p: (p.headroom_bytes, p.unit_id))
+        if target.headroom_bytes >= size:
+            target.io_pieces.append(name)
+            target.hot_bytes += size
             continue
-        target.io_pieces.append(name)
-        target.hot_bytes += size
+        if not allow_ssd_tier:
+            warnings.append(
+                f"{name} ({size / GB:.2f} GiB) fits in no unit's remaining "
+                f"RAM, and the SSD tier is disabled")
+            unplaced += size
+            continue
+        warnings.append(
+            f"{name} ({size / GB:.2f} GiB) does not fit in any unit's "
+            f"remaining RAM; it is placed on {target.unit_id}'s NVMe, which "
+            f"costs a streamed read once per token")
+        target.ssd_expert_bytes += size
+        target.io_pieces.append(f"{name}@ssd")
 
-    unplaced = 0
     if profile.engram is not None:
         host_by_layer: Dict[int, str] = {}
         for stage in stages:
@@ -671,23 +694,47 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
                     - units[uid].ssd_expert_bytes)
 
         for table, layer_id in enumerate(profile.engram.layer_ids):
-            size = profile.engram.table_bytes(table, profile.hidden_size,
-                                              profile.weights)
-            target_id = host_by_layer.get(layer_id)
-            if target_id is not None and ssd_room(target_id) < size:
+            host = host_by_layer.get(layer_id)
+            fuse = profile.engram.fusion_bytes(profile.hidden_size,
+                                               profile.weights)
+            fuse_target = units.get(host) if host is not None else None
+            if fuse_target is None or fuse_target.headroom_bytes < fuse:
+                fallback = max(units.values(),
+                               key=lambda p: (p.headroom_bytes, p.unit_id))
+                if fallback.headroom_bytes >= fuse:
+                    warnings.append(
+                        f"engram fusion for layer {layer_id} does not fit on "
+                        f"its stage host's RAM; it rides on "
+                        f"{fallback.unit_id}, so every token pays a cross-shelf "
+                        f"hop for it")
+                    fuse_target = fallback
+                else:
+                    fuse_target = None
+            if fuse_target is None:
+                unplaced += fuse
+            else:
+                fuse_target.hot_bytes += fuse
+                fuse_target.io_pieces.append(f"engram-{layer_id}-fuse")
+
+            rows = profile.engram.table_row_bytes(table, profile.weights)
+            if not allow_ssd_tier:
+                unplaced += rows
+                continue
+            target_id = host
+            if target_id is not None and ssd_room(target_id) < rows:
                 warnings.append(
-                    f"engram table at layer {layer_id} ({size / GB:.1f} GiB) "
+                    f"engram table at layer {layer_id} ({rows / GB:.1f} GiB) "
                     f"does not fit on its stage host's NVMe; looking across "
                     f"the fleet, so lookups pay a cross-shelf hop")
                 target_id = None
             if target_id is None:
-                fits = [uid for uid in units if ssd_room(uid) >= size]
+                fits = [uid for uid in units if ssd_room(uid) >= rows]
                 if not fits:
-                    unplaced += size
+                    unplaced += rows
                     continue
                 target_id = max(fits, key=lambda uid: (ssd_room(uid), uid))
             target = units[target_id]
-            target.ssd_expert_bytes += size
+            target.ssd_expert_bytes += rows
             target.io_pieces.append(f"engram-{layer_id}@ssd")
     return unplaced
 
@@ -722,6 +769,15 @@ def _estimate_decode(profile: ModelProfile,
             shards_by_layer.setdefault(shard.layer, []).append(
                 (plan.unit_id, shard))
 
+    # Which unit holds each Engram table's row store — the lookup reads rows
+    # off that unit's NVMe, plus a cross-shelf hop when it left its stage.
+    engram_holder: Dict[int, str] = {}
+    for plan in units.values():
+        for piece in plan.io_pieces:
+            if piece.startswith("engram-") and piece.endswith("@ssd"):
+                engram_holder[int(piece[len("engram-"):-len("@ssd")])] = (
+                    plan.unit_id)
+
     for stage in stages:
         host_cap = caps[stage.host_unit]
         for layer in stage.layers:
@@ -749,6 +805,24 @@ def _estimate_decode(profile: ModelProfile,
                 remote = remote or uid != stage.host_unit
             if remote:
                 worst += 2 * hop_seconds  # fan out, gather back
+            if (profile.engram is not None
+                    and layer in profile.engram.layer_ids):
+                # The lookup is serial with the layer that consumes it: row
+                # reads off the holder's NVMe, then the fusion projection off
+                # the stage host's RAM.
+                holder = engram_holder.get(layer)
+                worst = max(worst, _read_seconds(
+                    host_cap,
+                    profile.engram.fusion_bytes(profile.hidden_size,
+                                                profile.weights),
+                    "fast"))
+                if holder is not None:
+                    worst += _read_seconds(
+                        caps[holder],
+                        profile.engram.read_bytes_per_token(profile.weights),
+                        "ssd")
+                    if holder != stage.host_unit:
+                        worst += 2 * hop_seconds
             total += worst
             active_per_layer.append(touched)
 
