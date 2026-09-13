@@ -231,6 +231,7 @@ def deployment_config(plan, fleet: Sequence[FleetEntry]) -> Dict:
             "dense_layers": unit_plan.dense_layers,
             "io_pieces": unit_plan.io_pieces,
             "resident_bytes": unit_plan.resident_bytes,
+            "engram_ram_bytes": sum(unit_plan.engram_rows.values()),
             "capacity_bytes": unit_plan.capacity_bytes,
             "ssd_expert_bytes": unit_plan.ssd_expert_bytes,
             "shards": [shard.to_dict() for shard in unit_plan.shards],

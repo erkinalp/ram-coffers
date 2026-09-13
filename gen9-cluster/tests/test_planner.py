@@ -4,6 +4,7 @@ import dataclasses
 import unittest
 
 from gen9_cluster.hardware import GB, ConsoleUnit, Downbin, Runtime
+from gen9_cluster.inventory import deployment_config
 from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V4_1_FLASH,
                                 DEEPSEEK_V4_PRO)
 from gen9_cluster.planner import PlanningError, describe_plan, plan_split
@@ -156,6 +157,11 @@ class TestPlacement(unittest.TestCase):
             self.assertEqual(held, want)
             self.assertFalse(any(f"engram-{layer}@ssd" in u.io_pieces
                                  for u in plan.units.values()))
+        nodes = deployment_config(plan, [])["nodes"]
+        config_rows = sum(node["engram_ram_bytes"] for node in nodes.values())
+        plan_rows = sum(sum(u.engram_rows.values())
+                        for u in plan.units.values())
+        self.assertEqual(config_rows, plan_rows)
 
     def test_a_tiny_no_ssd_fleet_still_cannot_hold_v41(self):
         """Sharding needs RAM to shard into — a fleet without the ~183 GiB of
