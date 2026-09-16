@@ -4,9 +4,13 @@ import dataclasses
 import unittest
 
 from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_1_FLASH,
+                                DEEPSEEK_V4_1_FLASH_NVFP4,
+                                DEEPSEEK_V4_1_FLASH_REAP_256E,
+                                DEEPSEEK_V4_1_FLASH_REAP_272E,
                                 DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO,
-                                FP4_E4M3_16, FP8_UE8M0_32, MXFP4, PROFILES,
-                                profile_for)
+                                FP4_E4M3_16, FP8_UE8M0_32, GGUF_Q2_K, GGUF_Q6_K,
+                                MXFP4, NVFP4, PROFILES, QUANT_SPECS,
+                                profile_for, with_quant)
 
 GB = 1024 ** 3
 MB = 1024 ** 2
@@ -366,6 +370,68 @@ class TestPlanningLayers(unittest.TestCase):
                  + DEEPSEEK_V4_PRO.cold_bytes_per_moe_layer())
         mtp = DEEPSEEK_V4_PRO.mtp_bytes() / DEEPSEEK_V4_PRO.n_mtp_heads
         self.assertGreater(mtp, layer * 0.5)
+
+
+class TestQuantisedForms(unittest.TestCase):
+    """Community checkpoints are recipes on the same arithmetic: the planner
+    needs exact byte rates per format and a way to swap them per piece."""
+
+    def test_gguf_specs_carry_the_exact_superblock_rates(self):
+        """The q*_k formats pack their scales inside the block: 144 B per 256
+        for q4_k, 84 for q2_k, 210 for q6_k, and 34 B per 32 for q8_0."""
+        self.assertEqual(QUANT_SPECS["gguf-q4_k"].bytes_per_param, 0.5625)
+        self.assertEqual(QUANT_SPECS["gguf-q2_k"].bytes_per_param, 0.328125)
+        self.assertEqual(QUANT_SPECS["gguf-q6_k"].bytes_per_param, 0.8203125)
+        self.assertEqual(QUANT_SPECS["gguf-q8_0"].bytes_per_param, 1.0625)
+
+    def test_nvfp4_packs_like_the_e4m3_scale_per_16_format(self):
+        """NVFP4 is E2M1 values + an E4M3 scale per 16 + a tensor-level fp32
+        scale; that last term is ~4 B over millions of params, so the planner
+        uses the same 0.5625 figure it already models for the KV cache."""
+        self.assertEqual(NVFP4.bytes_per_param, 0.5625)
+        self.assertEqual(NVFP4, FP4_E4M3_16)
+        self.assertEqual(
+            DEEPSEEK_V4_1_FLASH_NVFP4.expert_quant, NVFP4)
+        self.assertEqual(
+            DEEPSEEK_V4_1_FLASH_NVFP4.weights, NVFP4)
+
+    def test_with_quant_repacks_the_pieces_it_names(self):
+        repacked = with_quant(DEEPSEEK_V4_1_FLASH, weights=GGUF_Q6_K,
+                              expert_weights=GGUF_Q2_K, kv_quant=GGUF_Q6_K,
+                              index_quant=GGUF_Q6_K)
+        self.assertEqual(repacked.weights, GGUF_Q6_K)
+        self.assertEqual(repacked.expert_quant, GGUF_Q2_K)
+        # The shared KV pools live on the attention config, which is frozen:
+        # the recipe has to replace it, not mutate it.
+        self.assertEqual(repacked.attention.kv_quant, GGUF_Q6_K)
+        self.assertEqual(repacked.attention.index_quant, GGUF_Q6_K)
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.weights, FP8_UE8M0_32)
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.attention.kv_quant, FP4_E4M3_16)
+        # A mixed recipe changes residency, not shape.
+        self.assertEqual(repacked.total_params(),
+                         DEEPSEEK_V4_1_FLASH.total_params())
+        self.assertLess(repacked.total_bytes(),
+                        DEEPSEEK_V4_1_FLASH.total_bytes())
+
+    def test_reap_profiles_keep_everything_but_the_expert_count(self):
+        """LibertAIDAI's REAP builds prune the routed pool — 256 or 272 of 384
+        — and change nothing else: same FP8/FP4 packing, same top-6."""
+        for profile, kept in ((DEEPSEEK_V4_1_FLASH_REAP_256E, 256),
+                              (DEEPSEEK_V4_1_FLASH_REAP_272E, 272)):
+            self.assertEqual(profile.moe.n_routed_experts, kept)
+            self.assertEqual(profile.moe.top_k, 6)
+            self.assertEqual(profile.weights, FP8_UE8M0_32)
+            self.assertEqual(profile.expert_quant, MXFP4)
+            self.assertLess(profile.total_bytes(),
+                            DEEPSEEK_V4_1_FLASH.total_bytes())
+        self.assertIn("deepseek-v4.1-flash-reap-256e", PROFILES)
+        self.assertIn("deepseek-v4.1-flash-reap-272e", PROFILES)
+
+    def test_named_lookup_finds_the_quantised_variants(self):
+        self.assertIs(profile_for("deepseek-v4.1-flash-reap-256e"),
+                      DEEPSEEK_V4_1_FLASH_REAP_256E)
+        self.assertIs(profile_for("deepseek-v4.1-flash-nvfp4"),
+                      DEEPSEEK_V4_1_FLASH_NVFP4)
 
 
 class TestProfileRegistry(unittest.TestCase):

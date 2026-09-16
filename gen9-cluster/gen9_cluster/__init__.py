@@ -22,9 +22,12 @@ from .hardware import (BOARD_TO_SKU, SKUS, ComputeBackend, ConsoleSKU,
                        Runtime, StorageSpec, FleetSummary, fleet_summary,
                        sku_for)
 from .model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_FLASH,
-                    DEEPSEEK_V4_PRO, PROFILES, AttentionConfig,
-                    HybridAttentionConfig, MLAConfig, ModelProfile, MoEConfig,
-                    QuantSpec, profile_for)
+                    DEEPSEEK_V4_PRO, DEEPSEEK_V4_1_FLASH,
+                    DEEPSEEK_V4_1_FLASH_NVFP4, DEEPSEEK_V4_1_FLASH_REAP_256E,
+                    DEEPSEEK_V4_1_FLASH_REAP_272E, PROFILES, QUANT_SPECS,
+                    AttentionConfig, HybridAttentionConfig, MLAConfig,
+                    ModelProfile, MoEConfig, QuantSpec, profile_for,
+                    with_quant)
 from .planner import (PlanningError, SplitPlan, StagePlan, UnitPlan,
                       describe_plan, plan_split)
 
@@ -35,8 +38,11 @@ __all__ = [
     "Downbin", "EffectiveCapability", "MemoryTier", "Runtime", "StorageSpec",
     "FleetSummary", "fleet_summary", "sku_for",
     "DEEPSEEK_TINY", "DEEPSEEK_V3", "DEEPSEEK_V4_FLASH", "DEEPSEEK_V4_PRO",
-    "PROFILES", "AttentionConfig", "HybridAttentionConfig", "MLAConfig",
-    "ModelProfile", "MoEConfig", "QuantSpec", "profile_for",
+    "DEEPSEEK_V4_1_FLASH", "DEEPSEEK_V4_1_FLASH_NVFP4",
+    "DEEPSEEK_V4_1_FLASH_REAP_256E", "DEEPSEEK_V4_1_FLASH_REAP_272E",
+    "PROFILES", "QUANT_SPECS", "AttentionConfig", "HybridAttentionConfig",
+    "MLAConfig", "ModelProfile", "MoEConfig", "QuantSpec", "profile_for",
+    "with_quant",
     "PlanningError", "SplitPlan", "StagePlan", "UnitPlan", "describe_plan",
     "plan_split",
     "__version__",

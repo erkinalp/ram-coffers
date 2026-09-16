@@ -35,13 +35,18 @@ byte counts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Dict, List, Optional, Tuple
 
 #: Bytes per parameter for the formats a console can hold, *before* block
-#: scales; :class:`QuantSpec` adds those.
+#: scales; :class:`QuantSpec` adds those. The ``q*_k``/``q8_0`` entries are
+#: ggml's GGUF block formats, for which the figure is the *whole* superblock
+#: rate (scales already inside the block): 34 B per 32 for q8_0, and
+#: 84/110/144/176/210 B per 256 for q2_k through q6_k.
 DTYPE_BYTES = {"fp8": 1.0, "fp4": 0.5, "mxfp4": 0.5,
-               "bf16": 2.0, "fp16": 2.0, "fp32": 4.0}
+               "bf16": 2.0, "fp16": 2.0, "fp32": 4.0,
+               "q8_0": 1.0625, "q6_k": 0.8203125, "q5_k": 0.6875,
+               "q4_k": 0.5625, "q3_k": 0.4296875, "q2_k": 0.328125}
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,39 @@ MXFP4 = QuantSpec("mxfp4", scale_bytes=1.0, scale_block=32)
 #: V4.1's KV-cache format: E2M1 values with one E4M3 scale per 16 channels.
 #: Not the OCP tile shape — 0.5625 bytes per cached element.
 FP4_E4M3_16 = QuantSpec("fp4", scale_bytes=1.0, scale_block=16)
+#: NVIDIA's NVFP4: E2M1 values, an E4M3 scale per 16 elements, plus one fp32
+#: scale per tensor — the tensor-level term is ~4 bytes over millions of
+#: parameters, so it packs identically to FP4_E4M3_16 here.
+NVFP4 = QuantSpec("fp4", scale_bytes=1.0, scale_block=16)
+
+#: The GGUF (ggml) block quants the community publishes V4.1 in — antirez's
+#: and friends'. Each is its exact superblock rate; recipes typically mix
+#: them per tensor class, which is what ``expert_weights`` is for.
+GGUF_Q8_0 = QuantSpec("q8_0")
+GGUF_Q6_K = QuantSpec("q6_k")
+GGUF_Q5_K = QuantSpec("q5_k")
+GGUF_Q4_K = QuantSpec("q4_k")
+GGUF_Q3_K = QuantSpec("q3_k")
+GGUF_Q2_K = QuantSpec("q2_k")
+
+#: Every named spec, for lookup by CLI flags and tools.
+QUANT_SPECS: Dict[str, QuantSpec] = {
+    "fp32": QuantSpec("fp32"),
+    "fp16": QuantSpec("fp16"),
+    "bf16": QuantSpec("bf16"),
+    "fp8-block128": FP8_BLOCK128,
+    "fp8-ue8m0": FP8_UE8M0,
+    "fp8-ue8m0-32": FP8_UE8M0_32,
+    "mxfp4": MXFP4,
+    "fp4-e4m3-16": FP4_E4M3_16,
+    "nvfp4": NVFP4,
+    "gguf-q8_0": GGUF_Q8_0,
+    "gguf-q6_k": GGUF_Q6_K,
+    "gguf-q5_k": GGUF_Q5_K,
+    "gguf-q4_k": GGUF_Q4_K,
+    "gguf-q3_k": GGUF_Q3_K,
+    "gguf-q2_k": GGUF_Q2_K,
+}
 
 
 class AttentionConfig:
@@ -1082,6 +1120,30 @@ DEEPSEEK_V4_1_FLASH = ModelProfile(
     source="deepseek-ai/DeepSeek-V4.1-Flash config.json",
 )
 
+#: LibertAIDAI's REAP-pruned forks of V4.1-Flash: the same checkpoint,
+#: quantisation, and top-6 routing with the routed-expert pool cut from 384
+#: to 256 or 272 (REAP removes the experts a calibration set least uses).
+#: Fewer experts is strictly a residency question — every read a token makes
+#: is the same size — so the derived profiles keep every other field.
+DEEPSEEK_V4_1_FLASH_REAP_256E = replace(
+    DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-reap-256e",
+    moe=replace(DEEPSEEK_V4_1_FLASH.moe, n_routed_experts=256),
+    source="LibertAIDAI/DeepSeek-V4.1-Flash-REAP-256E config.json")
+DEEPSEEK_V4_1_FLASH_REAP_272E = replace(
+    DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-reap-272e",
+    moe=replace(DEEPSEEK_V4_1_FLASH.moe, n_routed_experts=272),
+    source="LibertAIDAI/DeepSeek-V4.1-Flash-REAP-272E config.json")
+
+#: NVIDIA's NVFP4 build of V4.1-Flash (nvidia/AtomicChat/s-zaizen forks):
+#: the same checkpoint with all linear weights — routed experts included —
+#: at NVFP4 instead of the FP8/FP4 split. The FP4 cache formats are a
+#: serving choice and stay as the card ships them.
+DEEPSEEK_V4_1_FLASH_NVFP4 = replace(
+    DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-nvfp4",
+    weights=NVFP4, expert_weights=NVFP4,
+    source="nvidia/DeepSeek-V4.1-Flash-NVFP4 family")
+
+
 #: A small MoE with the same architecture, for a fleet of two or three consoles
 #: and for CI. Not a real checkpoint; a shape.
 DEEPSEEK_TINY = ModelProfile(
@@ -1099,9 +1161,46 @@ DEEPSEEK_TINY = ModelProfile(
     n_mtp_heads=0,
 )
 
+
+def with_quant(profile: ModelProfile, *,
+               weights: Optional[QuantSpec] = None,
+               expert_weights: Optional[QuantSpec] = None,
+               kv_quant: Optional[QuantSpec] = None,
+               index_quant: Optional[QuantSpec] = None,
+               name: Optional[str] = None) -> ModelProfile:
+    """A copy of ``profile`` re-packed in different quantisations.
+
+    Community checkpoints are recipes rather than formats — a GGUF build is
+    typically q6_k hot weights over q2_k experts, an NVFP4 build one format
+    throughout. The planner only needs the byte rates, and every piece
+    already sizes off the spec it lives under, so a recipe is just swapping
+    the fields. ``kv_quant``/``index_quant`` reach into the attention config
+    (a shared pool is one format in practice); fields a profile does not
+    have are left alone.
+    """
+    updated = profile
+    if weights is not None:
+        updated = replace(updated, weights=weights)
+    if expert_weights is not None:
+        updated = replace(updated, expert_weights=expert_weights)
+    if name is not None:
+        updated = replace(updated, name=name)
+    attention = updated.attention
+    if kv_quant is not None and isinstance(attention, CSA2Config):
+        attention = replace(attention, kv_quant=kv_quant)
+    if index_quant is not None and isinstance(
+            attention, (HybridAttentionConfig, CSA2Config)):
+        attention = replace(attention, index_quant=index_quant)
+    if attention is not updated.attention:
+        updated = replace(updated, attention=attention)
+    return updated
+
+
 PROFILES: Dict[str, ModelProfile] = {
     p.name: p for p in (DEEPSEEK_V3, DEEPSEEK_V4_PRO, DEEPSEEK_V4_FLASH,
-                        DEEPSEEK_V4_1_FLASH, DEEPSEEK_TINY)
+                        DEEPSEEK_V4_1_FLASH, DEEPSEEK_V4_1_FLASH_REAP_256E,
+                        DEEPSEEK_V4_1_FLASH_REAP_272E,
+                        DEEPSEEK_V4_1_FLASH_NVFP4, DEEPSEEK_TINY)
 }
 
 

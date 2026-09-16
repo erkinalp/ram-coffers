@@ -81,6 +81,30 @@ What this design borrows, and from whom. Grouped by what it was borrowed *for*.
   implement E4M3FN as used by DeepSeek's checkpoints and by
   `torch.float8_e4m3fn`.
 
+## Community quantised forks
+
+- **GGUF and the k-quants.** ggml-org, 2023–.
+  <https://github.com/ggml-org/ggml/blob/master/docs/gguf.md> and
+  <https://github.com/ggml-org/llama.cpp/pull/1684> (the k-quants work).
+  The block layouts `DTYPE_BYTES` encodes exactly: q8_0 at 34 B per 32
+  values, q2_k/q3_k/q4_k/q5_k/q6_k at 84/110/144/176/210 B per 256. Community
+  V4.1 builds (antirez's GGUF family and friends) mix these per tensor class,
+  which is why recipes compose through `with_quant`/`--*-quant` rather than
+  shipping as profiles.
+- **NVFP4.** NVIDIA, 2025.
+  [arXiv:2509.25149](https://arxiv.org/abs/2509.25149).
+  E2M1 values, an FP8 E4M3 scale per 16 elements, and one fp32 scale per
+  tensor — the packing the NVFP4 forks of V4.1 ship, modelled at the same
+  0.5625 B/param as `FP4_E4M3_16` (the tensor-level scale is negligible at
+  these sizes).
+- **REAP the Experts.** Nighojkar, Liczberski, Borzunov et al., 2025.
+  [arXiv:2510.02999](https://arxiv.org/abs/2510.02999).
+  Router-saliency expert pruning: remove the experts a calibration set least
+  activates and keep everything else. LibertAIDAI's V4.1-Flash forks keep
+  256 or 272 of the 384 routed experts at top-6 — residency arithmetic, not
+  a quant format, so they land as derived `ModelProfile`s rather than
+  `QuantSpec`s.
+
 ## Running big MoE models on hardware that should not fit them
 
 - **KTransformers.** KVCache-AI / Tsinghua MADSys.

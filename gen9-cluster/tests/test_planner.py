@@ -6,7 +6,9 @@ import unittest
 from gen9_cluster.hardware import GB, ConsoleUnit, Downbin, Runtime
 from gen9_cluster.inventory import deployment_config
 from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V4_1_FLASH,
-                                DEEPSEEK_V4_PRO)
+                                DEEPSEEK_V4_1_FLASH_REAP_256E,
+                                DEEPSEEK_V4_PRO, GGUF_Q2_K, GGUF_Q6_K,
+                                with_quant)
 from gen9_cluster.planner import (DEFAULT_HOP_SECONDS, PlanningError,
                                   _estimate_decode, describe_plan, plan_split)
 
@@ -223,6 +225,30 @@ class TestPlacement(unittest.TestCase):
             sum(1 for u in sharded.units.values() if layer in u.engram_rows)
             for layer in engram.layer_ids)
         self.assertGreaterEqual(sharded.active_units_per_token, max_holders)
+
+    def test_reap_256e_lowers_the_ram_only_floor(self):
+        """Pruning a third of the routed pool removes ~90 GiB of weights, so
+        the RAM-only floor drops from 43 to 35 PS5s — the kind of split a
+        quantised form changes, unlike speed."""
+        plan = plan_split(DEEPSEEK_V4_1_FLASH_REAP_256E, ps5_fleet(35),
+                          allow_ssd_tier=False)
+        self.assertTrue(plan.feasible)
+        with self.assertRaises(PlanningError):
+            plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(35),
+                       allow_ssd_tier=False)
+
+    def test_a_gguf_mixed_recipe_replans_at_the_new_rates(self):
+        """q6_k hot weights over q2_k experts is the shape of community GGUF
+        builds: the same model at ~70% of its FP8/FP4 residency, fitting a
+        RAM-only fleet the stock checkpoint can't."""
+        recipe = with_quant(DEEPSEEK_V4_1_FLASH, weights=GGUF_Q6_K,
+                            expert_weights=GGUF_Q2_K, kv_quant=GGUF_Q6_K,
+                            index_quant=GGUF_Q6_K)
+        plan = plan_split(recipe, ps5_fleet(30), allow_ssd_tier=False)
+        self.assertTrue(plan.feasible)
+        with self.assertRaises(PlanningError):
+            plan_split(DEEPSEEK_V4_1_FLASH, ps5_fleet(30),
+                       allow_ssd_tier=False)
 
     def test_a_tiny_no_ssd_fleet_still_cannot_hold_v41(self):
         """Sharding needs RAM to shard into — a fleet without the ~183 GiB of

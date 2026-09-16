@@ -158,6 +158,24 @@ just rescaling.
   planner sizes their hot and cold sides by the draft config, not the
   backbone's 384/top-6.
 
+## Quantised forks
+
+The HF community already ships V4.1 in cheaper formats, and the only planning
+question they change is how many consoles the residency fits on — the
+arithmetic itself is untouched, because every piece in the plan already sizes
+off the `QuantSpec` it lives under. Three shapes of fork exist:
+
+- **A repack.** NVFP4 builds put every linear weight at ~0.59 B/param and
+  land as a derived profile (`deepseek-v4.1-flash-nvfp4`, floor 37 RAM-only).
+- **A recipe.** GGUF/EXL3/MLX builds mix formats per tensor class — q6_k over
+  q2_k is the usual shape — so they compose at plan time via `with_quant`
+  or the `--weights-quant`/`--experts-quant`/`--kv-quant` flags rather than
+  as a named profile. The Engram tables follow `weights`, which is what the
+  builds do to embedding tensors anyway.
+- **A pruning.** REAP cuts the routed pool to 256 or 272 of 384 experts and
+  changes nothing else; `deepseek-v4.1-flash-reap-*` are derived profiles
+  with the smaller `n_routed_experts` and floors of 35/36 RAM-only.
+
 The floor drops from 83 PS5s (V4 Pro, RAM-only) to **43** — the ~183 GiB of
 Engram rows shard across fleet RAM when no drives are allowed — and to **24**
 with the SSD tier on, one more than V4 Pro's 23.

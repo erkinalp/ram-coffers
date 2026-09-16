@@ -56,8 +56,27 @@ reads. Nothing in this repository has run on a console yet.
 | `deepseek-v4-pro` | 1599 B | 49 B | 802 GiB | 83 |
 | `deepseek-v4-flash` | 291 B | 13 B | 148 GiB | 22 |
 | `deepseek-v4.1-flash` | 566 B + 197 B aux | 16 B (8 B prefill) | 468 GiB | 43 |
+| `deepseek-v4.1-flash-reap-256e` | 385 B + 197 B aux | 16 B | 378 GiB | 35 |
+| `deepseek-v4.1-flash-reap-272e` | 407 B + 197 B aux | 16 B | 390 GiB | 36 |
+| `deepseek-v4.1-flash-nvfp4` | 566 B + 197 B aux | 16 B | 401 GiB | 37 |
 | `deepseek-v3` | 683 B | 37 B | 638 GiB | 58 |
 | `deepseek-tiny` | — | — | 0.5 GiB | 1 (CI only) |
+
+The V4.1 variants are the community forks that change the placement math:
+REAP-256E/272E prune the routed pool to 256/272 of 384 experts (same FP8/FP4
+packing, same top-6 — pruning moves residency, not speed), and the NVFP4
+builds repack every linear weight at ~0.59 B/param. Any other recipe —
+GGUF's usual q6_k-over-q2_k mixes, EXL3-style sub-4-bit experts — composes
+at plan time rather than as a profile:
+
+```bash
+python3 -m gen9_cluster size --model deepseek-v4.1-flash --ps5 40 \
+        --weights-quant gguf-q6_k --experts-quant gguf-q2_k
+```
+
+`--weights-quant`, `--experts-quant`, and `--kv-quant` accept anything in
+`QUANT_SPECS` (the FP8/FP4 family, `nvfp4`, and the ggml block formats
+`gguf-q8_0` through `gguf-q2_k`) and work on every command that plans.
 
 All three V4-family profiles are the published configurations, not
 extrapolations, and the tests check them against the published parameter
@@ -109,6 +128,9 @@ python3 -m gen9_cluster model --model deepseek-v4-flash  # the small one
 python3 -m gen9_cluster model --model deepseek-v4.1-flash # the new arch
 python3 -m gen9_cluster size  --model deepseek-v4-pro --ps5 100 \
         --xbox-series-x 40 --bc-250 30                   # how many consoles
+python3 -m gen9_cluster size  --model deepseek-v4.1-flash-reap-256e --ps5 40
+python3 -m gen9_cluster size  --model deepseek-v4.1-flash --ps5 40 \
+        --experts-quant gguf-q2_k                        # a community recipe
 python3 -m gen9_cluster plan  fleet.json --config cluster.json
 python3 -m gen9_cluster probe                            # measure this box
 python3 -m gen9_cluster serve --unit-id ps5-01           # run a node
@@ -226,7 +248,7 @@ rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 
 **Measured** (on this x86-64 build host, not a console): the CPU kernel at
 67 GFLOP/s and 134 GB/s effective; the SPIR-V shader compiles and passes
-`spirv-val`; 159 Python tests pass, including the protocol, transport, dispatch
+`spirv-val`; 243 Python tests pass, including the protocol, transport, dispatch
 and coordinator paths over real loopback sockets.
 
 **Estimated**: every throughput figure for a console. They come from datasheet
