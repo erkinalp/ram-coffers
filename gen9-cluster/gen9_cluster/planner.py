@@ -54,7 +54,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .hardware import (BANDWIDTH_EFFICIENCY, GB, MB, ConsoleUnit,
                        EffectiveCapability)
-from .model import ModelProfile
+from .model import EngramConfig, ModelProfile, QuantSpec
 
 #: A weight read every token belongs in a coffer at least this fast. Below it,
 #: the hot block alone would dominate the layer's time budget. Chosen just under
@@ -104,6 +104,32 @@ class ExpertShard:
 
 
 @dataclass
+class EngramRowShard:
+    """One unit's slice of an Engram table's row store.
+
+    Rows are hash-addressed, so the routing map only has to say which row ids
+    each unit holds: a lookup hashes its n-grams to row ids, finds the units
+    owning those ranges, and gathers. ``tier`` is ``"ram"`` when the slice
+    sits in the unit's memory (the ``--no-ssd`` path) or ``"ssd"`` when the
+    whole table is one unit's NVMe resident — the record is the same either
+    way so a coordinator can route by row id without caring which tier the
+    store landed on.
+    """
+
+    layer: int
+    first_row: int
+    n_rows: int
+    byte_count: int
+    #: "ram" | "ssd" — which tier holds the rows.
+    tier: str
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"layer": self.layer, "first_row": self.first_row,
+                "n_rows": self.n_rows, "bytes": self.byte_count,
+                "tier": self.tier}
+
+
+@dataclass
 class UnitPlan:
     """Everything one console is asked to hold."""
 
@@ -124,6 +150,9 @@ class UnitPlan:
     #: Engram row bytes held in RAM (layer -> bytes) — the --no-ssd fallback,
     #: where a table shards across the fleet like a read-mostly expert.
     engram_rows: Dict[int, int] = field(default_factory=dict)
+    #: The row-range records behind ``engram_rows`` (plus whole-table records
+    #: for NVMe-resident stores): what a deployment loads and routes by.
+    engram_shards: List[EngramRowShard] = field(default_factory=list)
     kv_bytes: int = 0
     capacity_bytes: int = 0
     fast_capacity_bytes: int = 0
@@ -156,6 +185,7 @@ class UnitPlan:
             "slow_expert_bytes": self.slow_expert_bytes,
             "ssd_expert_bytes": self.ssd_expert_bytes,
             "engram_ram_bytes": sum(self.engram_rows.values()),
+            "engram_shards": [s.to_dict() for s in self.engram_shards],
             "kv_bytes": self.kv_bytes,
             "resident_bytes": self.resident_bytes,
             "capacity_bytes": self.capacity_bytes,
@@ -679,10 +709,12 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
                 f"RAM, and the SSD tier is disabled")
             unplaced += size
             continue
+        cadence = ("once per image" if name == "vision-encoder"
+                   else "once per token")
         warnings.append(
             f"{name} ({size / GB:.2f} GiB) does not fit in any unit's "
             f"remaining RAM; it is placed on {target.unit_id}'s NVMe, which "
-            f"costs a streamed read once per token")
+            f"costs a streamed read {cadence}")
         target.ssd_expert_bytes += size
         target.io_pieces.append(f"{name}@ssd")
 
@@ -730,8 +762,8 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
                 # instead — deterministic addressing means a lookup can route
                 # to whichever units hold the rows it needs.
                 unplaced += _place_engram_ram(
-                    layer_id, rows, shelf_by_layer[layer_id].expert_units,
-                    units, warnings)
+                    table, layer_id, profile.engram, profile.weights,
+                    shelf_by_layer[layer_id].expert_units, units, warnings)
                 continue
             target_id = host
             if target_id is not None and ssd_room(target_id) < rows:
@@ -749,10 +781,15 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
             target = units[target_id]
             target.ssd_expert_bytes += rows
             target.io_pieces.append(f"engram-{layer_id}@ssd")
+            target.engram_shards.append(EngramRowShard(
+                layer=layer_id, first_row=0,
+                n_rows=profile.engram.num_embeddings[table],
+                byte_count=rows, tier="ssd"))
     return unplaced
 
 
-def _place_engram_ram(layer_id: int, rows: int, shelf: Sequence[str],
+def _place_engram_ram(table: int, layer_id: int, engram: EngramConfig,
+                      quant: QuantSpec, shelf: Sequence[str],
                       units: Dict[str, UnitPlan],
                       warnings: List[str]) -> int:
     """Shard a table's row store across RAM — the ``--no-ssd`` path.
@@ -763,40 +800,58 @@ def _place_engram_ram(layer_id: int, rows: int, shelf: Sequence[str],
     any slice — and costly in the other: every token's lookup gathers from
     each holder over the network. Rows fill the table's own shelf first (one
     switch away from the fusion projection), then the roomiest fleet members.
+    The cut is in whole rows: each unit gets a contiguous ``[first_row,
+    first_row + n_rows)`` range, recorded as an ``EngramRowShard`` so the
+    deployment config can name exactly which rows to load where and route
+    lookups by row id.
     """
-    remaining = rows
-    ordered = sorted(shelf, key=lambda u: (-units[u].headroom_bytes, u))
-    for uid in ordered:
+    n_rows = engram.num_embeddings[table]
+    row_unit = engram.row_unit_bytes(quant)
+    total_bytes = engram.table_row_bytes(table, quant)
+    remaining = n_rows
+    first_row = 0
+    placed_bytes = 0
+
+    def take_into(uid: str) -> None:
+        nonlocal remaining, first_row, placed_bytes
         if remaining <= 0:
-            break
-        take = min(remaining, units[uid].headroom_bytes)
+            return
+        take = min(remaining, int(units[uid].headroom_bytes // row_unit))
         if take <= 0:
-            continue
-        units[uid].engram_rows[layer_id] = take
-        units[uid].io_pieces.append(f"engram-{layer_id}-rows")
+            return
+        # Rounding each slice can drift a byte or two off the table total;
+        # give the last slice the remainder so the records sum exactly.
+        byte_count = (total_bytes - placed_bytes if take == remaining
+                      else int(round(take * row_unit)))
+        unit = units[uid]
+        unit.engram_shards.append(EngramRowShard(
+            layer=layer_id, first_row=first_row, n_rows=take,
+            byte_count=byte_count, tier="ram"))
+        unit.engram_rows[layer_id] = (unit.engram_rows.get(layer_id, 0)
+                                      + byte_count)
+        unit.io_pieces.append(f"engram-{layer_id}-rows")
+        first_row += take
+        placed_bytes += byte_count
         remaining -= take
+
+    for uid in sorted(shelf, key=lambda u: (-units[u].headroom_bytes, u)):
+        take_into(uid)
     if remaining > 0:
         outside = sorted((u for u in units if u not in shelf),
                          key=lambda u: (-units[u].headroom_bytes, u))
         for uid in outside:
-            if remaining <= 0:
-                break
-            take = min(remaining, units[uid].headroom_bytes)
-            if take <= 0:
-                continue
-            units[uid].engram_rows[layer_id] = take
-            units[uid].io_pieces.append(f"engram-{layer_id}-rows")
-            remaining -= take
-        if remaining < rows:
+            take_into(uid)
+        if remaining < n_rows:
             warnings.append(
                 f"engram table at layer {layer_id} is sharded beyond its own "
                 f"shelf; every lookup gathers from those units over the "
                 f"network")
     if remaining > 0:
         warnings.append(
-            f"engram table at layer {layer_id} needs {rows / GB:.1f} GiB of "
-            f"RAM with no NVMe to use; {remaining / GB:.1f} GiB found nowhere")
-    return remaining
+            f"engram table at layer {layer_id} needs "
+            f"{total_bytes / GB:.1f} GiB of RAM with no NVMe to use; "
+            f"{remaining * row_unit / GB:.1f} GiB found nowhere")
+    return int(round(remaining * row_unit))
 
 
 # -- cost model ------------------------------------------------------------
@@ -851,7 +906,10 @@ def _estimate_decode(profile: ModelProfile,
             worst = _read_seconds(host_cap,
                                   _block_bytes(profile, layer) + kv_read,
                                   "fast")
-            touched = 1.0
+            # Units a token lights up, deduplicated: a console holding both
+            # experts and Engram rows still counts once, at its largest
+            # participation probability.
+            touched_by: Dict[str, float] = {stage.host_unit: 1.0}
             remote = False
             for uid, shard in shards_by_layer.get(layer, ()):
                 expected = shard.n_experts * top_k / n_routed
@@ -861,7 +919,9 @@ def _estimate_decode(profile: ModelProfile,
                                                  expected * expert_bytes,
                                                  shard.tier))
                 # P(this unit holds at least one of the token's top-k).
-                touched += 1.0 - (1.0 - shard.n_experts / n_routed) ** top_k
+                touched_by[uid] = max(
+                    touched_by.get(uid, 0.0),
+                    1.0 - (1.0 - shard.n_experts / n_routed) ** top_k)
                 remote = remote or uid != stage.host_unit
             if remote:
                 worst += 2 * hop_seconds  # fan out, gather back
@@ -881,12 +941,15 @@ def _estimate_decode(profile: ModelProfile,
                         caps[holder],
                         profile.engram.read_bytes_per_token(profile.weights),
                         "ssd")
+                    touched_by[holder] = 1.0
                     if holder != stage.host_unit:
                         worst += 2 * hop_seconds
                 else:
                     # RAM-sharded store: the token's rows are spread uniformly
                     # over the holders, each answering its share in parallel,
                     # and any holder outside the stage adds the gather hop.
+                    # Hash addressing means a lookup touches every holder, so
+                    # each counts fully toward the layer's fan-out.
                     shares = [(uid, units[uid].engram_rows[layer])
                               for uid in units
                               if layer in units[uid].engram_rows]
@@ -898,12 +961,33 @@ def _estimate_decode(profile: ModelProfile,
                                 profile.weights) * share / held)
                             worst = max(worst,
                                         _read_seconds(caps[uid], part, "slow"))
+                            touched_by[uid] = 1.0
                             remote_rows = (remote_rows
                                            or uid != stage.host_unit)
                         if remote_rows:
                             worst += 2 * hop_seconds
             total += worst
-            active_per_layer.append(touched)
+            active_per_layer.append(sum(touched_by.values()))
+
+    # io pieces that overflowed onto NVMe are part of the pipeline too: the
+    # embedding is read before the first stage and the lm_head after the last,
+    # so each costs its holder a streamed read plus one hop when it has to
+    # reach a different shelf. The vision tower is absent here on purpose —
+    # it is read once per *image*, not once per decoded token.
+    io_sizes = {"embedding": profile.embedding_bytes(),
+                "lm_head": profile.lm_head_bytes()}
+    consumer = {"embedding": stages[0].host_unit,
+                "lm_head": stages[-1].host_unit}
+    for plan in units.values():
+        for piece in plan.io_pieces:
+            if not piece.endswith("@ssd") or piece.startswith("engram-"):
+                continue
+            size = io_sizes.get(piece[:-len("@ssd")])
+            if size is None:
+                continue
+            total += _read_seconds(caps[plan.unit_id], size, "ssd")
+            if plan.unit_id != consumer[piece[:-len("@ssd")]]:
+                total += hop_seconds
 
     total += hop_seconds * max(0, len(stages) - 1)
     peak = max(active_per_layer) if active_per_layer else 0.0

@@ -516,6 +516,10 @@ class EngramConfig:
         """The hash-addressed row store: the NVMe-resident part of a table."""
         return int(round(self.table_params(table) * quant.bytes_per_param))
 
+    def row_unit_bytes(self, quant: QuantSpec) -> float:
+        """Bytes in one row — the unit a RAM shard map is cut in."""
+        return self.head_dim * quant.bytes_per_param
+
     def fusion_bytes(self, hidden_size: int, quant: QuantSpec) -> int:
         """The per-table projection back into hidden — read every token, so
         it belongs in the stage host's RAM, not on the drive."""
