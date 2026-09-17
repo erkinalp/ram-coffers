@@ -169,9 +169,10 @@ off the `QuantSpec` it lives under. Three shapes of fork exist:
   land as a derived profile (`deepseek-v4.1-flash-nvfp4`, floor 37 RAM-only).
 - **A recipe.** GGUF/EXL3/MLX builds mix formats per tensor class — q6_k over
   q2_k is the usual shape — so they compose at plan time via `with_quant`
-  or the `--weights-quant`/`--experts-quant`/`--kv-quant` flags rather than
-  as a named profile. The Engram tables follow `weights`, which is what the
-  builds do to embedding tensors anyway.
+  or the `--weights-quant`/`--experts-quant`/`--io-quant`/`--kv-quant` flags
+  rather than as a named profile. Embeddings and the LM head take `--io-quant`
+  (recipes keep them finer than experts); the Engram tables follow `weights`,
+  which is what the builds do to embedding-type tensors anyway.
 - **A pruning.** REAP cuts the routed pool to 256 or 272 of 384 experts and
   changes nothing else; `deepseek-v4.1-flash-reap-*` are derived profiles
   with the smaller `n_routed_experts` and floors of 35/36 RAM-only.

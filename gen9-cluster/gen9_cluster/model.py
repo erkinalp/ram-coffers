@@ -107,6 +107,7 @@ QUANT_SPECS: Dict[str, QuantSpec] = {
     "fp32": QuantSpec("fp32"),
     "fp16": QuantSpec("fp16"),
     "bf16": QuantSpec("bf16"),
+    "fp8": QuantSpec("fp8"),
     "fp8-block128": FP8_BLOCK128,
     "fp8-ue8m0": FP8_UE8M0,
     "fp8-ue8m0-32": FP8_UE8M0_32,
@@ -141,16 +142,16 @@ class AttentionConfig:
         """Parameters in one attention block."""
         raise NotImplementedError
 
-    def kv_cache_bytes_per_token(self, dtype: str = "bf16",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         """Cache one more token *adds* to this layer. May be zero."""
         raise NotImplementedError
 
-    def state_bytes(self, dtype: str = "bf16", layer: int = 0) -> int:
+    def state_bytes(self, dtype: Optional[str] = None, layer: int = 0) -> int:
         """Cache this layer holds regardless of context length."""
         return 0
 
-    def kv_read_bytes(self, context_tokens: int, dtype: str = "bf16",
+    def kv_read_bytes(self, context_tokens: int, dtype: Optional[str] = None,
                       layer: int = 0) -> int:
         """Cache one decoded token has to *read* — not what it stores."""
         return (context_tokens * self.kv_cache_bytes_per_token(dtype, layer)
@@ -167,6 +168,9 @@ class MLAConfig(AttentionConfig):
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     v_head_dim: int
+    #: Format of the cached latent. The decoupled RoPE key stays bf16 —
+    #: checkpoints keep it precise regardless of the latent's format.
+    kv_quant: QuantSpec = QuantSpec("fp8")
 
     @property
     def qk_head_dim(self) -> int:
@@ -175,15 +179,18 @@ class MLAConfig(AttentionConfig):
     def kind(self, layer: int = 0) -> str:
         return "mla"
 
-    def kv_cache_bytes_per_token(self, dtype: str = "fp8",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         """One layer's KV cache cost for one token.
 
         MLA stores the compressed latent (``kv_lora_rank``) plus the decoupled
         RoPE key (``qk_rope_head_dim``), shared across heads — the whole point of
         the architecture, and the reason a console can hold a long context.
+        ``dtype`` overrides ``kv_quant`` for ad-hoc queries.
         """
-        return int(round(self.kv_lora_rank * DTYPE_BYTES[dtype]
+        rate = (DTYPE_BYTES[dtype] if dtype is not None
+                else self.kv_quant.bytes_per_param)
+        return int(round(self.kv_lora_rank * rate
                          + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]))
 
     def weight_params(self, hidden_size: int, layer: int = 0) -> int:
@@ -250,6 +257,8 @@ class HybridAttentionConfig(AttentionConfig):
     compress_ratios: Tuple[int, ...] = ()
     #: The indexer's keys are cached and multiplied in FP4.
     index_quant: QuantSpec = MXFP4
+    #: Format of the cached KV entries; the RoPE dims stay bf16 either way.
+    kv_quant: QuantSpec = QuantSpec("fp8")
 
     def ratio(self, layer: int = 0) -> int:
         if not self.compress_ratios:
@@ -296,13 +305,15 @@ class HybridAttentionConfig(AttentionConfig):
                        + idx_c)
         return params
 
-    def kv_entry_bytes(self, dtype: str = "fp8") -> float:
-        """Bytes of one cached KV entry: FP8 for the non-RoPE part, BF16 for
-        the RoPE part, matching the V4 checkpoint format."""
+    def kv_entry_bytes(self, dtype: Optional[str] = None) -> float:
+        """Bytes of one cached KV entry: ``kv_quant`` for the non-RoPE part,
+        BF16 for the RoPE part, matching the V4 checkpoint format."""
+        rate = (DTYPE_BYTES[dtype] if dtype is not None
+                else self.kv_quant.bytes_per_param)
         nope = self.head_dim - self.qk_rope_head_dim
-        return nope * DTYPE_BYTES[dtype] + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]
+        return nope * rate + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]
 
-    def kv_cache_bytes_per_token(self, dtype: str = "fp8",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         kind = self.kind(layer)
         if kind == "swa":
@@ -314,7 +325,7 @@ class HybridAttentionConfig(AttentionConfig):
                       * self.index_quant.bytes_per_param / ratio)
         return int(round(entry))
 
-    def state_bytes(self, dtype: str = "fp8", layer: int = 0) -> int:
+    def state_bytes(self, dtype: Optional[str] = None, layer: int = 0) -> int:
         """The sliding-window branch, which every layer carries.
 
         Uncompressed tail tokens live here too; both are bounded, which is why
@@ -323,8 +334,8 @@ class HybridAttentionConfig(AttentionConfig):
         """
         return int(round(self.sliding_window * self.kv_entry_bytes(dtype)))
 
-    def kv_read_bytes(self, context_tokens: int, dtype: str = "fp8",
-                      layer: int = 0) -> int:
+    def kv_read_bytes(self, context_tokens: int,
+                      dtype: Optional[str] = None, layer: int = 0) -> int:
         kind = self.kind(layer)
         state = self.state_bytes(dtype, layer)
         if kind == "swa":
@@ -459,7 +470,7 @@ class CSA2Config(AttentionConfig):
     def index_entry_bytes(self) -> float:
         return self.index_head_dim * self.index_quant.bytes_per_param
 
-    def kv_cache_bytes_per_token(self, dtype: str = "fp4",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         """What one more token appends to this layer's streams — zero for the
         many layers that only read a shared pool."""
@@ -470,7 +481,8 @@ class CSA2Config(AttentionConfig):
             stored += self.index_entry_bytes() / self.csa_ratio
         return int(round(stored))
 
-    def state_bytes(self, dtype: str = "fp4", layer: int = 0) -> int:
+    def state_bytes(self, dtype: Optional[str] = None,
+                    layer: int = 0) -> int:
         """The sliding-window branch, which every block carries.
 
         V4.1's bounded-replay rule rebuilds this window instead of persisting
@@ -496,8 +508,8 @@ class CSA2Config(AttentionConfig):
                                 * self.candidate_block_size))
         return entries * self.index_entry_bytes()
 
-    def kv_read_bytes(self, context_tokens: int, dtype: str = "fp4",
-                      layer: int = 0) -> int:
+    def kv_read_bytes(self, context_tokens: int,
+                      dtype: Optional[str] = None, layer: int = 0) -> int:
         """Cache one decoded token reads — selected entries, plus this layer's
         own index scan if it performs one."""
         state = self.state_bytes(dtype, layer)
@@ -652,6 +664,9 @@ class ModelProfile:
     weights: QuantSpec = FP8_BLOCK128
     #: Format of the routed and shared expert weights, when it differs.
     expert_weights: Optional[QuantSpec] = None
+    #: Format of the embedding and LM-head tensors, when it differs — GGUF
+    #: recipes keep i/o tensors at their own rate (usually finer than experts).
+    io_quant: Optional[QuantSpec] = None
     #: Multi-token-prediction heads (V3 ships one; V4.1 ships three DSpark
     #: draft blocks). Each is a whole extra decoder block plus a head, so it
     #: is placed like a layer, not folded in.
@@ -682,6 +697,10 @@ class ModelProfile:
     @property
     def expert_quant(self) -> QuantSpec:
         return self.expert_weights or self.weights
+
+    @property
+    def io_spec(self) -> QuantSpec:
+        return self.io_quant or QUANT_SPECS["bf16"]
 
     @property
     def bytes_per_param(self) -> float:
@@ -809,7 +828,7 @@ class ModelProfile:
 
     def embedding_bytes(self) -> int:
         return int(round(self.vocab_size * self.hidden_size
-                         * DTYPE_BYTES["bf16"]))
+                         * self.io_spec.bytes_per_param))
 
     def lm_head_bytes(self) -> int:
         return self.embedding_bytes()
@@ -926,26 +945,27 @@ class ModelProfile:
         return int(params)
 
     def kv_cache_bytes_for_layer(self, layer: int, context_tokens: int,
-                                 dtype: str = "fp8") -> int:
+                                 dtype: Optional[str] = None) -> int:
         """Cache one layer holds for one sequence at this context length."""
         per_token = self.attention.kv_cache_bytes_per_token(dtype, layer)
         return context_tokens * per_token + self.attention.state_bytes(dtype,
                                                                        layer)
 
     def kv_read_bytes_for_layer(self, layer: int, context_tokens: int,
-                                dtype: str = "fp8") -> int:
+                                dtype: Optional[str] = None) -> int:
         """Cache one layer *reads* to decode one token.
 
         Equal to what it holds under dense attention, and far less under CSA.
         """
         return self.attention.kv_read_bytes(context_tokens, dtype, layer)
 
-    def kv_cache_bytes(self, context_tokens: int, dtype: str = "fp8") -> int:
+    def kv_cache_bytes(self, context_tokens: int,
+                       dtype: Optional[str] = None) -> int:
         return sum(self.kv_cache_bytes_for_layer(layer, context_tokens, dtype)
                    for layer in range(self.n_layers))
 
     def block_kv_bytes(self, index: int, context_tokens: int,
-                       dtype: str = "fp8") -> int:
+                       dtype: Optional[str] = None) -> int:
         """Cache block ``index`` holds, MTP heads included.
 
         An MTP head runs its own attention and so keeps its own cache; it is
@@ -954,7 +974,7 @@ class ModelProfile:
         return self.kv_cache_bytes_for_layer(index, context_tokens, dtype)
 
     def block_kv_read_bytes(self, index: int, context_tokens: int,
-                            dtype: str = "fp8") -> int:
+                            dtype: Optional[str] = None) -> int:
         return self.kv_read_bytes_for_layer(index, context_tokens, dtype)
 
     def activation_bytes(self, dtype: str = "bf16") -> int:
@@ -1165,28 +1185,32 @@ DEEPSEEK_TINY = ModelProfile(
 def with_quant(profile: ModelProfile, *,
                weights: Optional[QuantSpec] = None,
                expert_weights: Optional[QuantSpec] = None,
+               io_quant: Optional[QuantSpec] = None,
                kv_quant: Optional[QuantSpec] = None,
                index_quant: Optional[QuantSpec] = None,
                name: Optional[str] = None) -> ModelProfile:
     """A copy of ``profile`` re-packed in different quantisations.
 
     Community checkpoints are recipes rather than formats — a GGUF build is
-    typically q6_k hot weights over q2_k experts, an NVFP4 build one format
-    throughout. The planner only needs the byte rates, and every piece
-    already sizes off the spec it lives under, so a recipe is just swapping
-    the fields. ``kv_quant``/``index_quant`` reach into the attention config
-    (a shared pool is one format in practice); fields a profile does not
-    have are left alone.
+    typically q6_k hot weights over q2_k experts with the i/o tensors at
+    their own rate, an NVFP4 build one format throughout. The planner only
+    needs the byte rates, and every piece already sizes off the spec it
+    lives under, so a recipe is just swapping the fields. ``kv_quant`` and
+    ``index_quant`` reach into the attention config; a spec a profile has
+    no field for is left alone.
     """
     updated = profile
     if weights is not None:
         updated = replace(updated, weights=weights)
     if expert_weights is not None:
         updated = replace(updated, expert_weights=expert_weights)
+    if io_quant is not None:
+        updated = replace(updated, io_quant=io_quant)
     if name is not None:
         updated = replace(updated, name=name)
     attention = updated.attention
-    if kv_quant is not None and isinstance(attention, CSA2Config):
+    if kv_quant is not None and isinstance(
+            attention, (MLAConfig, HybridAttentionConfig, CSA2Config)):
         attention = replace(attention, kv_quant=kv_quant)
     if index_quant is not None and isinstance(
             attention, (HybridAttentionConfig, CSA2Config)):

@@ -45,11 +45,14 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
                         help="one-way network hop, in milliseconds")
     parser.add_argument("--weights-quant", choices=sorted(QUANT_SPECS),
                         default=None,
-                        help="re-pack the profile's hot/io weights in this "
+                        help="re-pack the profile's hot weights in this "
                              "format before planning")
     parser.add_argument("--experts-quant", choices=sorted(QUANT_SPECS),
                         default=None,
                         help="re-pack the routed experts in this format")
+    parser.add_argument("--io-quant", choices=sorted(QUANT_SPECS),
+                        default=None,
+                        help="re-pack the embedding and LM-head tensors")
     parser.add_argument("--kv-quant", choices=sorted(QUANT_SPECS),
                         default=None,
                         help="re-pack the KV cache (and its index pool)")
@@ -63,6 +66,7 @@ def _profile_for_args(args: argparse.Namespace) -> ModelProfile:
                  if args.weights_quant else None),
         expert_weights=(QUANT_SPECS[args.experts_quant]
                         if args.experts_quant else None),
+        io_quant=(QUANT_SPECS[args.io_quant] if args.io_quant else None),
         kv_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None),
         index_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None))
 
@@ -70,6 +74,7 @@ def _profile_for_args(args: argparse.Namespace) -> ModelProfile:
 def _quant_note(args: argparse.Namespace) -> str:
     parts = [("weights", getattr(args, "weights_quant", None)),
              ("experts", getattr(args, "experts_quant", None)),
+             ("io", getattr(args, "io_quant", None)),
              ("kv", getattr(args, "kv_quant", None))]
     return ", ".join(f"{k}={v}" for k, v in parts if v)
 

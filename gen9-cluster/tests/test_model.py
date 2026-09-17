@@ -9,8 +9,8 @@ from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_1_FLASH,
                                 DEEPSEEK_V4_1_FLASH_REAP_272E,
                                 DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO,
                                 FP4_E4M3_16, FP8_UE8M0_32, GGUF_Q2_K, GGUF_Q6_K,
-                                MXFP4, NVFP4, PROFILES, QUANT_SPECS,
-                                profile_for, with_quant)
+                                GGUF_Q8_0, MXFP4, NVFP4, PROFILES, QUANT_SPECS,
+                                QuantSpec, profile_for, with_quant)
 
 GB = 1024 ** 3
 MB = 1024 ** 2
@@ -426,6 +426,40 @@ class TestQuantisedForms(unittest.TestCase):
                             DEEPSEEK_V4_1_FLASH.total_bytes())
         self.assertIn("deepseek-v4.1-flash-reap-256e", PROFILES)
         self.assertIn("deepseek-v4.1-flash-reap-272e", PROFILES)
+
+    def test_io_quant_repacks_the_embedding_and_lm_head(self):
+        """GGUF recipes keep i/o tensors at their own rate — usually finer
+        than the experts' — so it is its own knob, not part of ``weights``."""
+        repacked = with_quant(DEEPSEEK_V4_1_FLASH, io_quant=GGUF_Q8_0)
+        expect = int(round(DEEPSEEK_V4_1_FLASH.vocab_size
+                           * DEEPSEEK_V4_1_FLASH.hidden_size * 1.0625))
+        self.assertEqual(repacked.embedding_bytes(), expect)
+        self.assertEqual(repacked.lm_head_bytes(), expect)
+        # ...while the default remains the checkpoints' bf16.
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.io_spec, QUANT_SPECS["bf16"])
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.embedding_bytes(),
+                         int(round(DEEPSEEK_V4_1_FLASH.vocab_size
+                                   * DEEPSEEK_V4_1_FLASH.hidden_size * 2.0)))
+
+    def test_kv_quant_reaches_every_attention_kind(self):
+        """MLA and Hybrid both store their caches under ``kv_quant`` now —
+        before, a recipe could only reach CSA2's pool."""
+        fp32 = QuantSpec("fp32")
+        v3 = with_quant(DEEPSEEK_V3, kv_quant=fp32)
+        mla = v3.attention
+        per_token = mla.kv_lora_rank * 4.0 + mla.qk_rope_head_dim * 2.0
+        self.assertEqual(mla.kv_cache_bytes_per_token(), int(round(per_token)))
+        self.assertGreater(v3.kv_cache_bytes(8192),
+                           DEEPSEEK_V3.kv_cache_bytes(8192))
+        # Hybrid too: the whole entry repacks, not just the index pool.
+        v4 = with_quant(DEEPSEEK_V4_FLASH, kv_quant=fp32)
+        hybrid = v4.attention
+        entry = ((hybrid.head_dim - hybrid.qk_rope_head_dim) * 4.0
+                 + hybrid.qk_rope_head_dim * 2.0)
+        self.assertEqual(hybrid.kv_entry_bytes(), entry)
+        # ...and an explicit dtype still wins over the configured spec.
+        self.assertEqual(hybrid.kv_entry_bytes("fp8"),
+                         DEEPSEEK_V4_FLASH.attention.kv_entry_bytes())
 
     def test_named_lookup_finds_the_quantised_variants(self):
         self.assertIs(profile_for("deepseek-v4.1-flash-reap-256e"),

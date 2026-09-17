@@ -74,9 +74,11 @@ python3 -m gen9_cluster size --model deepseek-v4.1-flash --ps5 40 \
         --weights-quant gguf-q6_k --experts-quant gguf-q2_k
 ```
 
-`--weights-quant`, `--experts-quant`, and `--kv-quant` accept anything in
-`QUANT_SPECS` (the FP8/FP4 family, `nvfp4`, and the ggml block formats
-`gguf-q8_0` through `gguf-q2_k`) and work on every command that plans.
+`--weights-quant`, `--experts-quant`, `--io-quant`, and `--kv-quant` accept
+anything in `QUANT_SPECS` (the FP8/FP4 family, `nvfp4`, and the ggml block
+formats `gguf-q8_0` through `gguf-q2_k`) and work on every command that
+plans. `--io-quant` repacks the embedding and LM head, which GGUF recipes
+usually keep at a finer rate than the experts.
 
 All three V4-family profiles are the published configurations, not
 extrapolations, and the tests check them against the published parameter
