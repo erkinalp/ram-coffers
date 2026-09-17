@@ -67,58 +67,101 @@ class ExpertWeights:
     up: np.ndarray
     down: np.ndarray
     scales: Optional[np.ndarray] = None
-    #: The storage encoding: "fp32" for an ordinary buffer,
-    #: "fp8-e4m3-b128" for FP8 codes whose scales live in ``scales``, or a
-    #: :mod:`gen9_cluster.quants` block format whose scales are packed into
-    #: the blocks themselves.
+    #: The storage encoding: "fp32" for an ordinary buffer, "fp16"/"bf16"
+    #: for a dense shard kept at its wire width, "fp8-e4m3-b128" for FP8
+    #: codes whose scales live in ``scales``, "fp8-e4m3-tile" for the
+    #: tile-scaled FP8 layouts, or a :mod:`gen9_cluster.quants` block format
+    #: whose scales are packed into the blocks themselves.
     format: str = "fp32"
+    #: (rows, cols) one scale covers, for the tile-scaled FP8 encodings.
+    #: None is the flat per-128 layout of ``fp8-e4m3-b128``.
+    scale_tile: Optional[Tuple[int, int]] = None
+    #: Per-matrix fp32 tensor scale, for NVFP4 — three entries, gate, up,
+    #: down, applied on top of the in-block scales when the expert is
+    #: dequantised. None for every other format.
+    tensor_scale: Optional[np.ndarray] = None
     #: "fast" | "slow" | "ssd" — which coffer this came out of.
     tier: str = "fast"
 
     @property
     def nbytes(self) -> int:
         total = self.gate.nbytes + self.up.nbytes + self.down.nbytes
-        return total + (self.scales.nbytes if self.scales is not None else 0)
+        if self.scales is not None:
+            total += self.scales.nbytes
+        if self.tensor_scale is not None:
+            total += self.tensor_scale.nbytes
+        return total
 
     @property
     def quantised(self) -> bool:
         return self.gate.dtype == np.uint8
 
-    def dequantised(self) -> "ExpertWeights":
-        """An fp32 copy, for runners that cannot read FP8 themselves.
+    @property
+    def packed_fp8(self) -> bool:
+        """Flat per-128-block FP8 the compiled kernel can read directly."""
+        return (self.quantised and self.scales is not None
+                and self.scale_tile is None)
 
-        This throws away the whole point of FP8 — the expert is four times its
-        stored size while it is being used — so it is done per call and
-        discarded, never cached. A console that does this for every token is
-        one whose compiled kernel failed to build, and its throughput will say
-        so loudly.
+    def dequantised(self) -> "ExpertWeights":
+        """An fp32 copy, for runners that cannot read the storage encoding.
+
+        This throws away the whole point of the packed formats — the expert is
+        several times its stored size while it is being used — so it is done
+        per call and discarded, never cached. A console that does this for
+        every token is one whose compiled kernel failed to build, and its
+        throughput will say so loudly.
         """
         if not self.quantised:
+            if self.format in ("fp16", "bf16"):
+                return ExpertWeights(
+                    gate=quants.decode_dense(self.gate, self.format),
+                    up=quants.decode_dense(self.up, self.format),
+                    down=quants.decode_dense(self.down, self.format),
+                    tier=self.tier)
             return self
-        if self.scales is None and self.format != "fp8-e4m3-b128":
-            if self.format == "fp32":
-                raise ValueError("a quantised expert carries neither a "
-                                 "format nor block scales; the shard is "
-                                 "incomplete")
-            return ExpertWeights(
+        if self.scales is None and self.format not in (
+                "fp32", "fp8-e4m3-b128", "fp8-e4m3-tile"):
+            # A block-packed codec: scales live inside the blocks, and NVFP4
+            # adds a per-matrix tensor scale on top.
+            decoded = ExpertWeights(
                 gate=quants.dequantize_rows(self.gate, self.format),
                 up=quants.dequantize_rows(self.up, self.format),
                 down=quants.dequantize_rows(self.down, self.format),
                 tier=self.tier)
-        if self.format not in ("fp32", "fp8-e4m3-b128"):
+            if self.tensor_scale is not None:
+                decoded.gate *= self.tensor_scale[0]
+                decoded.up *= self.tensor_scale[1]
+                decoded.down *= self.tensor_scale[2]
+            return decoded
+        if self.format not in ("fp32", "fp8-e4m3-b128", "fp8-e4m3-tile"):
             raise ValueError(f"a {self.format} expert packs its scales into "
                              "the blocks; a separate scale array means the "
                              "shard is malformed")
-        # ``scales`` present, or an explicitly FP8 shard: the classic
-        # codes-then-scales layout. (Experts built ad-hoc with uint8 codes
-        # and a scale array — the format field left at its default — are
-        # this too.)
+        # ``scales`` present, or an explicitly FP8 shard: a codes-then-scales
+        # layout, flat or tiled. (Experts built ad-hoc with uint8 codes and a
+        # scale array — the format field left at its default — are the flat
+        # kind too.)
         if self.scales is None:
-            raise ValueError("an FP8 expert without block scales cannot be "
-                             "decoded; the shard is incomplete")
+            raise ValueError("a quantised expert carries neither a format "
+                             "nor block scales; the shard is incomplete")
+        flat = np.asarray(self.scales, dtype=np.float32).reshape(-1)
+        if self.scale_tile is not None:
+            counts = [fp8.tile_scales_needed(array.shape, self.scale_tile)
+                      for array in (self.gate, self.up, self.down)]
+            if flat.size != sum(counts):
+                raise ValueError(f"expert needs {sum(counts)} tile scales, "
+                                 f"carries {flat.size}")
+            first, second = counts[0], counts[0] + counts[1]
+            return ExpertWeights(
+                gate=fp8.dequantize_tiled(self.gate, flat[:first],
+                                          self.scale_tile),
+                up=fp8.dequantize_tiled(self.up, flat[first:second],
+                                        self.scale_tile),
+                down=fp8.dequantize_tiled(self.down, flat[second:],
+                                          self.scale_tile),
+                tier=self.tier)
         sizes = [array.size for array in (self.gate, self.up, self.down)]
         counts = [fp8.n_blocks(size) for size in sizes]
-        flat = np.asarray(self.scales, dtype=np.float32).reshape(-1)
         if flat.size != sum(counts):
             raise ValueError(f"expert needs {sum(counts)} block scales, "
                              f"carries {flat.size}")
@@ -148,7 +191,7 @@ class ExpertRunner:
         """``gate_i * expert_i(activation)`` for each expert, as a 2-D array."""
         out = np.empty((len(experts), activation.size), dtype=np.float32)
         for index, (weights, gate) in enumerate(zip(experts, gates)):
-            if weights.quantised:
+            if weights.quantised or weights.format != "fp32":
                 weights = weights.dequantised()
             hidden = activation @ weights.gate.T
             hidden = hidden * (1.0 / (1.0 + np.exp(-hidden)))   # SiLU
@@ -428,6 +471,8 @@ class NodeServer:
         try:
             if header.dtype is DType.FP8_E4M3_B128:
                 self._load_fp8(header, body)
+            elif header.dtype.fp8_tile is not None:
+                self._load_fp8_tiled(header, body)
             elif header.dtype.packed:
                 self._load_packed(header, body)
             else:
@@ -438,10 +483,12 @@ class NodeServer:
                      expert=header.first_expert, dtype=header.dtype)
 
     def _load_dense(self, header: ShardHeader, body: bytes) -> None:
-        """A dense shard: fp32, fp16 or bf16, decoded to fp32 at load.
+        """A dense shard: fp32, fp16 or bf16, kept at its wire width.
 
-        Dense formats carry no scales, so there is nothing to keep packed —
-        the fp32 up-conversion happens once here instead of per token.
+        Dense formats carry no scales, but fp16 and bf16 still stay stored as
+        they arrived — the plan budgeted two bytes per parameter and decoding
+        to fp32 here would double it. ``dequantised`` up-converts per use,
+        exactly like the block-packed formats.
         """
         per_expert = 3 * header.hidden_size * header.intermediate_size
         array = np.frombuffer(body, dtype=header.dtype.numpy)
@@ -457,15 +504,13 @@ class NodeServer:
             self.store.put(
                 header.layer, header.first_expert + index,
                 ExpertWeights(
-                    gate=quants.decode_dense(
-                        gate.reshape(header.intermediate_size,
-                                     header.hidden_size), dtype_name),
-                    up=quants.decode_dense(
-                        up.reshape(header.intermediate_size,
-                                   header.hidden_size), dtype_name),
-                    down=quants.decode_dense(
-                        down.reshape(header.hidden_size,
-                                     header.intermediate_size), dtype_name),
+                    gate=gate.reshape(header.intermediate_size,
+                                      header.hidden_size),
+                    up=up.reshape(header.intermediate_size,
+                                  header.hidden_size),
+                    down=down.reshape(header.hidden_size,
+                                      header.intermediate_size),
+                    format=dtype_name,
                     tier=header.tier))
 
     def _load_fp8(self, header: ShardHeader, body: bytes) -> None:
@@ -518,11 +563,14 @@ class NodeServer:
         mismatch worth refusing loudly.
         """
         codec = header.dtype.codec
+        #: NVFP4 packs the same blocks but ships one fp32 tensor scale as a
+        #: trailer after each matrix's blocks.
+        matrix_trailer = 4 if header.dtype is DType.NVFP4 else 0
         hidden_row = quants.block_bytes_per_row(header.hidden_size, codec)
         inter_row = quants.block_bytes_per_row(header.intermediate_size, codec)
         gate_bytes = header.intermediate_size * hidden_row
         down_bytes = header.hidden_size * inter_row
-        per_expert = 2 * gate_bytes + down_bytes
+        per_expert = 2 * (gate_bytes + matrix_trailer) + down_bytes + matrix_trailer
         expected = header.n_experts * per_expert
         if len(body) != expected:
             raise ValueError(f"{codec} shard body is {len(body)} bytes, "
@@ -531,10 +579,22 @@ class NodeServer:
             base = index * per_expert
             gate = np.frombuffer(body, dtype=np.uint8, count=gate_bytes,
                                  offset=base)
+            up_at = base + gate_bytes + matrix_trailer
             up = np.frombuffer(body, dtype=np.uint8, count=gate_bytes,
-                               offset=base + gate_bytes)
+                               offset=up_at)
+            down_at = up_at + gate_bytes + matrix_trailer
             down = np.frombuffer(body, dtype=np.uint8, count=down_bytes,
-                                 offset=base + 2 * gate_bytes)
+                                 offset=down_at)
+            tensor_scale = None
+            if matrix_trailer:
+                tensor_scale = np.array([
+                    np.frombuffer(body, dtype="<f4", count=1,
+                                  offset=base + gate_bytes)[0],
+                    np.frombuffer(body, dtype="<f4", count=1,
+                                  offset=up_at + gate_bytes)[0],
+                    np.frombuffer(body, dtype="<f4", count=1,
+                                  offset=down_at + down_bytes)[0]],
+                    dtype=np.float32)
             self.store.put(
                 header.layer, header.first_expert + index,
                 ExpertWeights(
@@ -542,6 +602,54 @@ class NodeServer:
                     up=up.reshape(header.intermediate_size, hidden_row),
                     down=down.reshape(header.hidden_size, inter_row),
                     format=codec,
+                    tensor_scale=tensor_scale,
+                    tier=header.tier))
+
+    def _load_fp8_tiled(self, header: ShardHeader, body: bytes) -> None:
+        """An FP8 shard whose scales tile the 2-D matrices, not the flat run.
+
+        Same codes-then-scales separation as the flat layout; the scale dtype
+        and tile shape come from the wire code. UE8M0 exponents are upcast to
+        fp32 here — a lossless one-time cost — so ``dequantised`` only ever
+        sees one scale representation.
+        """
+        tile = header.dtype.fp8_tile
+        assert tile is not None
+        scale_np = np.dtype(header.dtype.fp8_scale_dtype)
+        inter, hidden = header.intermediate_size, header.hidden_size
+        matrix = hidden * inter
+        per_expert = 3 * matrix
+        n_codes = header.n_experts * per_expert
+        gate_up_tiles = fp8.tile_scales_needed((inter, hidden), tile)
+        down_tiles = fp8.tile_scales_needed((hidden, inter), tile)
+        scales_per_expert = 2 * gate_up_tiles + down_tiles
+        n_scales = header.n_experts * scales_per_expert
+        expected = n_codes + scale_np.itemsize * n_scales
+        if len(body) != expected:
+            raise ValueError(f"{header.dtype.name} shard body is {len(body)} "
+                             f"bytes, expected {expected} ({n_codes} codes + "
+                             f"{n_scales} tile scales)")
+        codes = np.frombuffer(body, dtype=np.uint8, count=n_codes)
+        raw_scales = np.frombuffer(body, dtype=scale_np, count=n_scales,
+                                   offset=n_codes)
+        scales = (fp8.decode_ue8m0(raw_scales) if scale_np.itemsize == 1
+                  else np.asarray(raw_scales, dtype=np.float32))
+        for index in range(header.n_experts):
+            chunk = codes[index * per_expert:(index + 1) * per_expert]
+            gate, up, down = np.split(chunk, 3)
+            self.store.put(
+                header.layer, header.first_expert + index,
+                ExpertWeights(
+                    gate=gate.reshape(header.intermediate_size,
+                                      header.hidden_size),
+                    up=up.reshape(header.intermediate_size,
+                                  header.hidden_size),
+                    down=down.reshape(header.hidden_size,
+                                      header.intermediate_size),
+                    scales=scales[index * scales_per_expert:
+                                  (index + 1) * scales_per_expert],
+                    format="fp8-e4m3-tile",
+                    scale_tile=tile,
                     tier=header.tier))
 
     def _on_ping(self, frame: Frame) -> Frame:

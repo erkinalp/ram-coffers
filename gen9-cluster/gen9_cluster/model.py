@@ -43,7 +43,7 @@ from typing import Dict, List, Optional, Tuple
 #: ggml's GGUF block formats, for which the figure is the *whole* superblock
 #: rate (scales already inside the block): 34 B per 32 for q8_0, and
 #: 84/110/144/176/210 B per 256 for q2_k through q6_k.
-DTYPE_BYTES = {"fp8": 1.0, "fp4": 0.5, "mxfp4": 0.5,
+DTYPE_BYTES = {"fp8": 1.0, "fp4": 0.5, "mxfp4": 0.5, "nvfp4": 0.5,
                "bf16": 2.0, "fp16": 2.0, "fp32": 4.0,
                "q8_0": 1.0625, "q6_k": 0.8203125, "q5_k": 0.6875,
                "q4_k": 0.5625, "q3_k": 0.4296875, "q2_k": 0.328125}
@@ -89,8 +89,10 @@ MXFP4 = QuantSpec("mxfp4", scale_bytes=1.0, scale_block=32)
 FP4_E4M3_16 = QuantSpec("fp4", scale_bytes=1.0, scale_block=16)
 #: NVIDIA's NVFP4: E2M1 values, an E4M3 scale per 16 elements, plus one fp32
 #: scale per tensor — the tensor-level term is ~4 bytes over millions of
-#: parameters, so it packs identically to FP4_E4M3_16 here.
-NVFP4 = QuantSpec("fp4", scale_bytes=1.0, scale_block=16)
+#: parameters, so it packs at the FP4_E4M3_16 rate here. Its dtype name is
+#: distinct because the wire format must carry that tensor scale: it is part
+#: of the encoding, not something a loader may drop.
+NVFP4 = QuantSpec("nvfp4", scale_bytes=1.0, scale_block=16)
 
 #: The GGUF (ggml) block quants the community publishes V4.1 in — antirez's
 #: and friends'. Each is its exact superblock rate; recipes typically mix
@@ -662,8 +664,17 @@ class ModelProfile:
     moe: MoEConfig
     #: Format of everything read for every token.
     weights: QuantSpec = FP8_BLOCK128
-    #: Format of the routed and shared expert weights, when it differs.
+    #: Format of the routed expert weights, when it differs.
     expert_weights: Optional[QuantSpec] = None
+    #: Format of the shared experts, when it differs from the routed
+    #: experts'. NVIDIA's NVFP4 build quantizes the backbone's routed experts
+    #: alone — every shared expert stays bf16 — so it cannot ride
+    #: ``expert_weights``. Unset, they inherit the routed experts' format.
+    shared_expert_weights: Optional[QuantSpec] = None
+    #: Format of the draft blocks' experts, routed and shared alike — the
+    #: NVFP4 build leaves all of ``mtp.*`` unquantized. Unset, they inherit
+    #: the routed experts' format.
+    draft_expert_weights: Optional[QuantSpec] = None
     #: Format of the embedding and LM-head tensors, when it differs — GGUF
     #: recipes keep i/o tensors at their own rate (usually finer than experts).
     io_quant: Optional[QuantSpec] = None
@@ -732,15 +743,32 @@ class ModelProfile:
             return self.draft_moe
         return self.moe
 
+    def _routed_expert_quant(self, index: Optional[int]) -> QuantSpec:
+        """The format a routed expert in block ``index`` is packed in."""
+        if index is not None and index >= self.n_layers:
+            return self.draft_expert_weights or self.expert_quant
+        return self.expert_quant
+
+    def _shared_expert_quant(self, index: Optional[int]) -> QuantSpec:
+        """The format a shared expert in block ``index`` is packed in."""
+        if index is not None and index >= self.n_layers:
+            return (self.draft_expert_weights or self.shared_expert_weights
+                    or self.expert_quant)
+        return self.shared_expert_weights or self.expert_quant
+
     def expert_bytes(self, index: Optional[int] = None) -> int:
         """One routed expert, packed, block scales included."""
         moe = self.moe if index is None else self.moe_for_block(index)
         params = moe.expert_params() * self.hidden_size
-        return int(round(params * self.expert_quant.bytes_per_param))
+        return int(round(params
+                         * self._routed_expert_quant(index).bytes_per_param))
 
     def shared_expert_bytes(self, index: Optional[int] = None) -> int:
         moe = self.moe if index is None else self.moe_for_block(index)
-        return self.expert_bytes(index) * moe.n_shared_experts
+        params = moe.expert_params() * self.hidden_size
+        return int(round(params
+                         * self._shared_expert_quant(index).bytes_per_param
+                         * moe.n_shared_experts))
 
     def attention_bytes(self, layer: int = 0) -> int:
         params = self.attention.weight_params(self.hidden_size, layer)
@@ -1157,14 +1185,16 @@ DEEPSEEK_V4_1_FLASH_REAP_272E = replace(
 #: NVIDIA's NVFP4 build of V4.1-Flash. Its hf_quant_config.json quantizes
 #: *only* the routed experts — ``*.attn.*``, ``*.ffn.shared_experts.*``,
 #: ``head``, and ``mtp.*`` are all in the ignore list — so hot weights,
-#: i/o, the Engram tables, and the draft blocks stay bf16. ``expert_weights``
-#: covers the draft experts too, a small over-quantisation the config
-#: refuses; a per-block expert field would be the only fix. A hypothetical
-#: all-linear NVFP4 build is a recipe, ``--weights-quant nvfp4
+#: i/o, the Engram tables, and the draft blocks stay bf16. The routed
+#: experts alone take NVFP4; the shared and draft experts are separate
+#: fields because the config quantizes them differently, not at all. A
+#: hypothetical all-linear NVFP4 build is a recipe, ``--weights-quant nvfp4
 #: --experts-quant nvfp4``, not this profile.
 DEEPSEEK_V4_1_FLASH_NVFP4 = replace(
     DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-nvfp4",
     weights=QUANT_SPECS["bf16"], expert_weights=NVFP4,
+    shared_expert_weights=QUANT_SPECS["bf16"],
+    draft_expert_weights=QUANT_SPECS["bf16"],
     source="nvidia/DeepSeek-V4.1-Flash-NVFP4 hf_quant_config.json")
 
 
@@ -1189,6 +1219,8 @@ DEEPSEEK_TINY = ModelProfile(
 def with_quant(profile: ModelProfile, *,
                weights: Optional[QuantSpec] = None,
                expert_weights: Optional[QuantSpec] = None,
+               shared_expert_weights: Optional[QuantSpec] = None,
+               draft_expert_weights: Optional[QuantSpec] = None,
                io_quant: Optional[QuantSpec] = None,
                kv_quant: Optional[QuantSpec] = None,
                index_quant: Optional[QuantSpec] = None,
@@ -1211,6 +1243,12 @@ def with_quant(profile: ModelProfile, *,
         updated = replace(updated, weights=weights)
     if expert_weights is not None:
         updated = replace(updated, expert_weights=expert_weights)
+    if shared_expert_weights is not None:
+        updated = replace(updated,
+                          shared_expert_weights=shared_expert_weights)
+    if draft_expert_weights is not None:
+        updated = replace(updated,
+                          draft_expert_weights=draft_expert_weights)
     if io_quant is not None:
         updated = replace(updated, io_quant=io_quant)
     if name is not None:

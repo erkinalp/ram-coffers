@@ -390,9 +390,13 @@ class TestQuantisedForms(unittest.TestCase):
     def test_nvfp4_packs_like_the_e4m3_scale_per_16_format(self):
         """NVFP4 is E2M1 values + an E4M3 scale per 16 + a tensor-level fp32
         scale; that last term is ~4 B over millions of params, so the planner
-        uses the same 0.5625 figure it already models for the KV cache."""
+        uses the same 0.5625 figure it already models for the KV cache. The
+        dtype is still distinct: the wire has to carry the tensor scale, so
+        the spec names its own format."""
         self.assertEqual(NVFP4.bytes_per_param, 0.5625)
-        self.assertEqual(NVFP4, FP4_E4M3_16)
+        self.assertEqual(NVFP4.bytes_per_param, FP4_E4M3_16.bytes_per_param)
+        self.assertNotEqual(NVFP4, FP4_E4M3_16)
+        self.assertEqual(NVFP4.dtype, "nvfp4")
 
     def test_the_nvfp4_checkpoint_quantizes_only_the_routed_experts(self):
         """nvidia's hf_quant_config.json lists only ``layers.*.ffn.experts``
@@ -403,6 +407,22 @@ class TestQuantisedForms(unittest.TestCase):
         self.assertEqual(profile.expert_quant, NVFP4)
         self.assertEqual(profile.weights, QUANT_SPECS["bf16"])
         self.assertEqual(profile.io_spec, QUANT_SPECS["bf16"])
+        # The shared and draft experts are in the config's ignore list, so
+        # they price at bf16 — routing them through the routed-expert format
+        # would undercount residency by ~20 GiB.
+        self.assertEqual(profile.shared_expert_weights, QUANT_SPECS["bf16"])
+        self.assertEqual(profile.draft_expert_weights, QUANT_SPECS["bf16"])
+        draft = profile.n_layers  # the first draft block's index
+        params = profile.moe.expert_params() * profile.hidden_size
+        draft_params = profile.draft_moe.expert_params() * profile.hidden_size
+        self.assertEqual(profile.shared_expert_bytes(0),
+                         int(round(params * 2.0)))
+        self.assertEqual(profile.shared_expert_bytes(draft),
+                         int(round(draft_params * 2.0)))
+        self.assertEqual(profile.expert_bytes(draft),
+                         int(round(draft_params * 2.0)))
+        self.assertEqual(profile.expert_bytes(0),
+                         int(round(params * 0.5625)))
         self.assertGreater(profile.total_bytes(),
                            DEEPSEEK_V4_1_FLASH.total_bytes())
 

@@ -58,7 +58,7 @@ reads. Nothing in this repository has run on a console yet.
 | `deepseek-v4.1-flash` | 566 B + 197 B aux | 16 B (8 B prefill) | 468 GiB | 43 |
 | `deepseek-v4.1-flash-reap-256e` | 385 B + 197 B aux | 16 B | 378 GiB | 35 |
 | `deepseek-v4.1-flash-reap-272e` | 407 B + 197 B aux | 16 B | 390 GiB | 36 |
-| `deepseek-v4.1-flash-nvfp4` | 566 B + 197 B aux | 16 B | 673 GiB | 61 |
+| `deepseek-v4.1-flash-nvfp4` | 566 B + 197 B aux | 16 B | 693 GiB | 63 |
 | `deepseek-v3` | 683 B | 37 B | 638 GiB | 58 |
 | `deepseek-tiny` | — | — | 0.5 GiB | 1 (CI only) |
 
@@ -241,8 +241,9 @@ rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 
 - `node.py` — the console-side worker: shard store (RAM or mmap'd NVMe),
   expert execution, block forwarding. Shards load dense (fp32/fp16/bf16),
-  FP8-with-scales, or block-packed (GGUF quants, mxfp4, fp4) — the packed
-  formats stay packed in the coffer and dequantise per use.
+  FP8-with-scales (flat or tile), or block-packed (GGUF quants, mxfp4,
+  fp4/nvfp4) — everything stays at its wire width in the coffer and
+  dequantises per use.
 - `quants.py` — the numpy decoders for the block-packed formats, ported from
   the published ggml layouts; the same job `fp8.py` does for FP8.
 - `dispatch.py` — groups a token's experts by console, one batched request each,
@@ -258,7 +259,7 @@ rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 
 **Measured** (on this x86-64 build host, not a console): the CPU kernel at
 67 GFLOP/s and 134 GB/s effective; the SPIR-V shader compiles and passes
-`spirv-val`; 263 Python tests pass, including the protocol, transport, dispatch
+`spirv-val`; 266 Python tests pass, including the protocol, transport, dispatch
 and coordinator paths over real loopback sockets.
 
 **Estimated**: every throughput figure for a console. They come from datasheet
@@ -291,7 +292,7 @@ See [docs/GEN9_SPLITTING.md](docs/GEN9_SPLITTING.md) for the arithmetic and
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 263 tests
+python3 -m unittest discover -s tests -t .   # 266 tests
 cd kernels && make && make test              # CPU kernel + FP8 conformance
 make vulkan                                  # needs glslang-tools
 make hip                                     # needs hipcc; skipped otherwise

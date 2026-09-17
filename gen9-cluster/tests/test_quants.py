@@ -11,8 +11,9 @@ import unittest
 
 import numpy as np
 
-from gen9_cluster import quants
+from gen9_cluster import fp8, quants
 from gen9_cluster.errors import Gen9Error
+from gen9_cluster.model import QuantSpec
 from gen9_cluster.node import NodeServer, ShardStore
 from gen9_cluster.protocol import (DType, ExpertBatchPayload,
                                    ExpertRowsPayload, Frame, MsgType,
@@ -247,12 +248,34 @@ class TestWireFormats(unittest.TestCase):
         for name, wire in (("fp32", DType.FP32), ("fp16", DType.FP16),
                            ("bf16", DType.BF16), ("fp8", DType.FP8_E4M3_B128),
                            ("mxfp4", DType.MXFP4), ("fp4", DType.FP4_E4M3_16),
+                           ("nvfp4", DType.NVFP4),
                            ("q8_0", DType.GGUF_Q8_0), ("q2_k", DType.GGUF_Q2_K),
                            ("q3_k", DType.GGUF_Q3_K), ("q4_k", DType.GGUF_Q4_K),
                            ("q5_k", DType.GGUF_Q5_K), ("q6_k", DType.GGUF_Q6_K)):
             self.assertIs(DType.for_spec(name), wire)
         with self.assertRaises(ValueError):
             DType.for_spec("iq4_nl")
+
+    def test_fp8_specs_dispatch_on_their_scale_geometry(self):
+        """Stock checkpoints ship tile scales, not one fp32 per 128 flat
+        elements — the wire dtype has to know which layout it carries."""
+        for spec, wire in (
+                (QuantSpec("fp8"), DType.FP8_E4M3_B128),
+                (QuantSpec("fp8", scale_bytes=4.0, scale_block=128),
+                 DType.FP8_E4M3_B128),
+                (QuantSpec("fp8", scale_bytes=4.0, scale_block=128 * 128),
+                 DType.FP8_E4M3_T128),
+                (QuantSpec("fp8", scale_bytes=1.0, scale_block=128 * 128),
+                 DType.FP8_E4M3_T128_UE8M0),
+                (QuantSpec("fp8", scale_bytes=1.0, scale_block=32 * 32),
+                 DType.FP8_E4M3_T32_UE8M0)):
+            self.assertIs(DType.for_spec(spec), wire)
+        with self.assertRaises(ValueError):
+            DType.for_spec(QuantSpec("fp8", scale_bytes=1.0,
+                                     scale_block=64 * 64))
+        self.assertEqual(DType.FP8_E4M3_T32_UE8M0.fp8_tile, (32, 32))
+        self.assertEqual(DType.FP8_E4M3_T128.fp8_scale_dtype, "<f4")
+        self.assertIsNone(DType.FP32.fp8_tile)
 
     def test_packed_dtypes_report_their_codec_and_rate(self):
         self.assertTrue(DType.GGUF_Q6_K.packed)
@@ -345,7 +368,9 @@ class TestPackedShardLoading(unittest.TestCase):
                       header.encode() + b"\x00" * 8192))
         self.assertFalse(self.store.holds(2, 0))
 
-    def test_dense_fp16_and_bf16_shards_decode_at_load(self):
+    def test_dense_fp16_and_bf16_shards_stay_at_wire_width(self):
+        """fp16/bf16 carry no scales, but the plan budgeted two bytes per
+        parameter — decoding to fp32 at load would double the residency."""
         rng = np.random.default_rng(5)
         matrices = rng.standard_normal((3, INTERMEDIATE, HIDDEN)
                                        ).astype(np.float32) * 0.1
@@ -355,13 +380,74 @@ class TestPackedShardLoading(unittest.TestCase):
         self.assertEqual(reply.msg_type, MsgType.LOAD_ACK)
         held = self.store.get(1, 0)
         self.assertFalse(held.quantised)
-        np.testing.assert_allclose(held.gate, matrices[0], atol=1e-3)
+        self.assertEqual(held.format, "fp16")
+        self.assertEqual(held.gate.dtype, np.float16)
+        self.assertEqual(held.nbytes, len(body16.tobytes()))
+        np.testing.assert_allclose(
+            held.dequantised().gate, matrices[0], atol=1e-3)
 
         u16 = (matrices.reshape(-1).view(np.uint32) >> 16).astype(np.uint16)
         reply = self._load(DType.BF16, u16.tobytes())
         self.assertEqual(reply.msg_type, MsgType.LOAD_ACK)
+        held = self.store.get(1, 0)
+        self.assertEqual(held.format, "bf16")
+        self.assertEqual(held.nbytes, len(u16.tobytes()))
         np.testing.assert_allclose(
-            self.store.get(1, 0).up, matrices[1], atol=0.02)
+            held.dequantised().up, matrices[1], atol=0.02)
+
+    def test_an_fp8_tile_shard_decodes_with_its_tile_geometry(self):
+        """V4.1's ue8m0-per-32x32-tile scales: the wire dtype carries the
+        geometry, the loader upcasts the exponents, and dequantisation is
+        per tile, not per flat 128."""
+        rng = np.random.default_rng(11)
+        codes = rng.integers(0, 128, size=(3, INTERMEDIATE, HIDDEN),
+                             dtype=np.uint8)
+        ue = rng.integers(118, 128, size=(3, INTERMEDIATE // 32,
+                                          HIDDEN // 32), dtype=np.uint8)
+        body = codes.reshape(-1).tobytes() + ue.reshape(-1).tobytes()
+        reply = self._load(DType.FP8_E4M3_T32_UE8M0, body)
+        self.assertEqual(reply.msg_type, MsgType.LOAD_ACK)
+        held = self.store.get(1, 0)
+        self.assertTrue(held.quantised)
+        self.assertEqual(held.format, "fp8-e4m3-tile")
+        self.assertEqual(held.scale_tile, (32, 32))
+        scales = np.ldexp(
+            np.ones(ue.shape, dtype=np.float32),
+            ue.astype(np.int16) - 127)
+        plain = held.dequantised()
+        for mi, got in enumerate((plain.gate, plain.up, plain.down)):
+            expect = (fp8.decode(codes[mi])
+                      * np.repeat(np.repeat(scales[mi], 32, axis=0),
+                                  32, axis=1))
+            np.testing.assert_allclose(got, expect)
+
+    def test_an_nvfp4_shard_applies_its_tensor_scale(self):
+        """The tensor-level fp32 rides behind each matrix's blocks; dropping
+        it would misvalue every weight."""
+        d = np.full(4, 0x38, np.uint8)                  # ue4m3 scale = 1.0
+        v = np.tile(np.arange(16, dtype=np.uint8), 4)
+        qs = np.zeros(32, np.uint8)
+        for j in range(4):
+            for i in range(8):
+                qs[j * 8 + i] = v[j * 16 + i] | (v[j * 16 + 8 + i] << 4)
+        block = np.concatenate([d, qs])
+        row = np.tile(block, HIDDEN // 64)
+        matrices = np.tile(row, (3, INTERMEDIATE, 1))
+        tensor_scales = np.array([0.5, 0.25, 2.0], dtype=np.float32)
+        body = b"".join(
+            matrices[mi].tobytes()
+            + tensor_scales[mi].tobytes() for mi in range(3))
+
+        reply = self._load(DType.NVFP4, body)
+        self.assertEqual(reply.msg_type, MsgType.LOAD_ACK)
+        held = self.store.get(1, 0)
+        self.assertEqual(held.format, "nvfp4")
+        np.testing.assert_array_equal(held.tensor_scale, tensor_scales)
+        plain = held.dequantised()
+        decoded = _E2M1_X2[v] / 2                       # scale-1.0 blocks
+        for mi, got in enumerate((plain.gate, plain.up, plain.down)):
+            expect = np.tile(decoded, (INTERMEDIATE, HIDDEN // 64))
+            np.testing.assert_allclose(got, expect * tensor_scales[mi])
 
 
 if __name__ == "__main__":

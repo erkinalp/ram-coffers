@@ -76,10 +76,14 @@ class CpuKernelRunner(ExpertRunner):
             # A row of a C-contiguous array is itself contiguous, so the kernel
             # writes its expert's output straight into place.
             row = out[index]
-            if weights.quantised:
+            if weights.packed_fp8:
                 self._run_fp8(weights, x, row, scratch, hidden, intermediate)
             else:
-                self._run_f32(weights, x, row, scratch, hidden, intermediate)
+                # Every other encoding — tile-scaled FP8, the block-packed
+                # formats, fp16/bf16 storage — has no compiled kernel yet, so
+                # the portable decoders up-convert and the f32 kernel runs.
+                self._run_f32(weights.dequantised(), x, row, scratch,
+                              hidden, intermediate)
             row *= np.float32(gate)
         return out
 
