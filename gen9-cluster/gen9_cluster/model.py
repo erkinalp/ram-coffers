@@ -35,13 +35,18 @@ byte counts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Dict, List, Optional, Tuple
 
 #: Bytes per parameter for the formats a console can hold, *before* block
-#: scales; :class:`QuantSpec` adds those.
-DTYPE_BYTES = {"fp8": 1.0, "fp4": 0.5, "mxfp4": 0.5,
-               "bf16": 2.0, "fp16": 2.0, "fp32": 4.0}
+#: scales; :class:`QuantSpec` adds those. The ``q*_k``/``q8_0`` entries are
+#: ggml's GGUF block formats, for which the figure is the *whole* superblock
+#: rate (scales already inside the block): 34 B per 32 for q8_0, and
+#: 84/110/144/176/210 B per 256 for q2_k through q6_k.
+DTYPE_BYTES = {"fp8": 1.0, "fp4": 0.5, "mxfp4": 0.5, "nvfp4": 0.5,
+               "bf16": 2.0, "fp16": 2.0, "fp32": 4.0,
+               "q8_0": 1.0625, "q6_k": 0.8203125, "q5_k": 0.6875,
+               "q4_k": 0.5625, "q3_k": 0.4296875, "q2_k": 0.328125}
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,42 @@ MXFP4 = QuantSpec("mxfp4", scale_bytes=1.0, scale_block=32)
 #: V4.1's KV-cache format: E2M1 values with one E4M3 scale per 16 channels.
 #: Not the OCP tile shape — 0.5625 bytes per cached element.
 FP4_E4M3_16 = QuantSpec("fp4", scale_bytes=1.0, scale_block=16)
+#: NVIDIA's NVFP4: E2M1 values, an E4M3 scale per 16 elements, plus one fp32
+#: scale per tensor — the tensor-level term is ~4 bytes over millions of
+#: parameters, so it packs at the FP4_E4M3_16 rate here. Its dtype name is
+#: distinct because the wire format must carry that tensor scale: it is part
+#: of the encoding, not something a loader may drop.
+NVFP4 = QuantSpec("nvfp4", scale_bytes=1.0, scale_block=16)
+
+#: The GGUF (ggml) block quants the community publishes V4.1 in — antirez's
+#: and friends'. Each is its exact superblock rate; recipes typically mix
+#: them per tensor class, which is what ``expert_weights`` is for.
+GGUF_Q8_0 = QuantSpec("q8_0")
+GGUF_Q6_K = QuantSpec("q6_k")
+GGUF_Q5_K = QuantSpec("q5_k")
+GGUF_Q4_K = QuantSpec("q4_k")
+GGUF_Q3_K = QuantSpec("q3_k")
+GGUF_Q2_K = QuantSpec("q2_k")
+
+#: Every named spec, for lookup by CLI flags and tools.
+QUANT_SPECS: Dict[str, QuantSpec] = {
+    "fp32": QuantSpec("fp32"),
+    "fp16": QuantSpec("fp16"),
+    "bf16": QuantSpec("bf16"),
+    "fp8": QuantSpec("fp8", scale_bytes=4.0, scale_block=128),
+    "fp8-block128": FP8_BLOCK128,
+    "fp8-ue8m0": FP8_UE8M0,
+    "fp8-ue8m0-32": FP8_UE8M0_32,
+    "mxfp4": MXFP4,
+    "fp4-e4m3-16": FP4_E4M3_16,
+    "nvfp4": NVFP4,
+    "gguf-q8_0": GGUF_Q8_0,
+    "gguf-q6_k": GGUF_Q6_K,
+    "gguf-q5_k": GGUF_Q5_K,
+    "gguf-q4_k": GGUF_Q4_K,
+    "gguf-q3_k": GGUF_Q3_K,
+    "gguf-q2_k": GGUF_Q2_K,
+}
 
 
 class AttentionConfig:
@@ -103,16 +144,21 @@ class AttentionConfig:
         """Parameters in one attention block."""
         raise NotImplementedError
 
-    def kv_cache_bytes_per_token(self, dtype: str = "bf16",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         """Cache one more token *adds* to this layer. May be zero."""
         raise NotImplementedError
 
-    def state_bytes(self, dtype: str = "bf16", layer: int = 0) -> int:
+    def state_bytes(self, dtype: Optional[str] = None, layer: int = 0) -> int:
         """Cache this layer holds regardless of context length."""
         return 0
 
-    def kv_read_bytes(self, context_tokens: int, dtype: str = "bf16",
+    def cache_specs(self) -> Dict[str, "QuantSpec"]:
+        """The quantised pools this attention kind keeps — ``kv`` for every
+        kind, ``index`` where the architecture has one."""
+        return {}
+
+    def kv_read_bytes(self, context_tokens: int, dtype: Optional[str] = None,
                       layer: int = 0) -> int:
         """Cache one decoded token has to *read* — not what it stores."""
         return (context_tokens * self.kv_cache_bytes_per_token(dtype, layer)
@@ -129,6 +175,12 @@ class MLAConfig(AttentionConfig):
     qk_nope_head_dim: int
     qk_rope_head_dim: int
     v_head_dim: int
+    #: Format of the cached latent. The decoupled RoPE key stays bf16 —
+    #: checkpoints keep it precise regardless of the latent's format.
+    kv_quant: QuantSpec = QuantSpec("fp8")
+
+    def cache_specs(self) -> Dict[str, QuantSpec]:
+        return {"kv": self.kv_quant}
 
     @property
     def qk_head_dim(self) -> int:
@@ -137,15 +189,18 @@ class MLAConfig(AttentionConfig):
     def kind(self, layer: int = 0) -> str:
         return "mla"
 
-    def kv_cache_bytes_per_token(self, dtype: str = "fp8",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         """One layer's KV cache cost for one token.
 
         MLA stores the compressed latent (``kv_lora_rank``) plus the decoupled
         RoPE key (``qk_rope_head_dim``), shared across heads — the whole point of
         the architecture, and the reason a console can hold a long context.
+        ``dtype`` overrides ``kv_quant`` for ad-hoc queries.
         """
-        return int(round(self.kv_lora_rank * DTYPE_BYTES[dtype]
+        rate = (DTYPE_BYTES[dtype] if dtype is not None
+                else self.kv_quant.bytes_per_param)
+        return int(round(self.kv_lora_rank * rate
                          + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]))
 
     def weight_params(self, hidden_size: int, layer: int = 0) -> int:
@@ -212,6 +267,11 @@ class HybridAttentionConfig(AttentionConfig):
     compress_ratios: Tuple[int, ...] = ()
     #: The indexer's keys are cached and multiplied in FP4.
     index_quant: QuantSpec = MXFP4
+    #: Format of the cached KV entries; the RoPE dims stay bf16 either way.
+    kv_quant: QuantSpec = QuantSpec("fp8")
+
+    def cache_specs(self) -> Dict[str, QuantSpec]:
+        return {"kv": self.kv_quant, "index": self.index_quant}
 
     def ratio(self, layer: int = 0) -> int:
         if not self.compress_ratios:
@@ -258,13 +318,15 @@ class HybridAttentionConfig(AttentionConfig):
                        + idx_c)
         return params
 
-    def kv_entry_bytes(self, dtype: str = "fp8") -> float:
-        """Bytes of one cached KV entry: FP8 for the non-RoPE part, BF16 for
-        the RoPE part, matching the V4 checkpoint format."""
+    def kv_entry_bytes(self, dtype: Optional[str] = None) -> float:
+        """Bytes of one cached KV entry: ``kv_quant`` for the non-RoPE part,
+        BF16 for the RoPE part, matching the V4 checkpoint format."""
+        rate = (DTYPE_BYTES[dtype] if dtype is not None
+                else self.kv_quant.bytes_per_param)
         nope = self.head_dim - self.qk_rope_head_dim
-        return nope * DTYPE_BYTES[dtype] + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]
+        return nope * rate + self.qk_rope_head_dim * DTYPE_BYTES["bf16"]
 
-    def kv_cache_bytes_per_token(self, dtype: str = "fp8",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         kind = self.kind(layer)
         if kind == "swa":
@@ -276,7 +338,7 @@ class HybridAttentionConfig(AttentionConfig):
                       * self.index_quant.bytes_per_param / ratio)
         return int(round(entry))
 
-    def state_bytes(self, dtype: str = "fp8", layer: int = 0) -> int:
+    def state_bytes(self, dtype: Optional[str] = None, layer: int = 0) -> int:
         """The sliding-window branch, which every layer carries.
 
         Uncompressed tail tokens live here too; both are bounded, which is why
@@ -285,8 +347,8 @@ class HybridAttentionConfig(AttentionConfig):
         """
         return int(round(self.sliding_window * self.kv_entry_bytes(dtype)))
 
-    def kv_read_bytes(self, context_tokens: int, dtype: str = "fp8",
-                      layer: int = 0) -> int:
+    def kv_read_bytes(self, context_tokens: int,
+                      dtype: Optional[str] = None, layer: int = 0) -> int:
         kind = self.kind(layer)
         state = self.state_bytes(dtype, layer)
         if kind == "swa":
@@ -370,6 +432,9 @@ class CSA2Config(AttentionConfig):
     kv_quant: QuantSpec = FP4_E4M3_16
     index_quant: QuantSpec = FP4_E4M3_16
 
+    def cache_specs(self) -> Dict[str, QuantSpec]:
+        return {"kv": self.kv_quant, "index": self.index_quant}
+
     def ratio(self, layer: int = 0) -> int:
         if not self.compress_ratios:
             return self.csa_ratio
@@ -421,7 +486,7 @@ class CSA2Config(AttentionConfig):
     def index_entry_bytes(self) -> float:
         return self.index_head_dim * self.index_quant.bytes_per_param
 
-    def kv_cache_bytes_per_token(self, dtype: str = "fp4",
+    def kv_cache_bytes_per_token(self, dtype: Optional[str] = None,
                                  layer: int = 0) -> int:
         """What one more token appends to this layer's streams — zero for the
         many layers that only read a shared pool."""
@@ -432,7 +497,8 @@ class CSA2Config(AttentionConfig):
             stored += self.index_entry_bytes() / self.csa_ratio
         return int(round(stored))
 
-    def state_bytes(self, dtype: str = "fp4", layer: int = 0) -> int:
+    def state_bytes(self, dtype: Optional[str] = None,
+                    layer: int = 0) -> int:
         """The sliding-window branch, which every block carries.
 
         V4.1's bounded-replay rule rebuilds this window instead of persisting
@@ -458,8 +524,8 @@ class CSA2Config(AttentionConfig):
                                 * self.candidate_block_size))
         return entries * self.index_entry_bytes()
 
-    def kv_read_bytes(self, context_tokens: int, dtype: str = "fp4",
-                      layer: int = 0) -> int:
+    def kv_read_bytes(self, context_tokens: int,
+                      dtype: Optional[str] = None, layer: int = 0) -> int:
         """Cache one decoded token reads — selected entries, plus this layer's
         own index scan if it performs one."""
         state = self.state_bytes(dtype, layer)
@@ -612,8 +678,20 @@ class ModelProfile:
     moe: MoEConfig
     #: Format of everything read for every token.
     weights: QuantSpec = FP8_BLOCK128
-    #: Format of the routed and shared expert weights, when it differs.
+    #: Format of the routed expert weights, when it differs.
     expert_weights: Optional[QuantSpec] = None
+    #: Format of the shared experts, when it differs from the routed
+    #: experts'. NVIDIA's NVFP4 build quantizes the backbone's routed experts
+    #: alone — every shared expert stays bf16 — so it cannot ride
+    #: ``expert_weights``. Unset, they inherit the routed experts' format.
+    shared_expert_weights: Optional[QuantSpec] = None
+    #: Format of the draft blocks' experts, routed and shared alike — the
+    #: NVFP4 build leaves all of ``mtp.*`` unquantized. Unset, they inherit
+    #: the routed experts' format.
+    draft_expert_weights: Optional[QuantSpec] = None
+    #: Format of the embedding and LM-head tensors, when it differs — GGUF
+    #: recipes keep i/o tensors at their own rate (usually finer than experts).
+    io_quant: Optional[QuantSpec] = None
     #: Multi-token-prediction heads (V3 ships one; V4.1 ships three DSpark
     #: draft blocks). Each is a whole extra decoder block plus a head, so it
     #: is placed like a layer, not folded in.
@@ -646,6 +724,10 @@ class ModelProfile:
         return self.expert_weights or self.weights
 
     @property
+    def io_spec(self) -> QuantSpec:
+        return self.io_quant or QUANT_SPECS["bf16"]
+
+    @property
     def bytes_per_param(self) -> float:
         return self.weights.bytes_per_param
 
@@ -675,15 +757,32 @@ class ModelProfile:
             return self.draft_moe
         return self.moe
 
+    def _routed_expert_quant(self, index: Optional[int]) -> QuantSpec:
+        """The format a routed expert in block ``index`` is packed in."""
+        if index is not None and index >= self.n_layers:
+            return self.draft_expert_weights or self.expert_quant
+        return self.expert_quant
+
+    def _shared_expert_quant(self, index: Optional[int]) -> QuantSpec:
+        """The format a shared expert in block ``index`` is packed in."""
+        if index is not None and index >= self.n_layers:
+            return (self.draft_expert_weights or self.shared_expert_weights
+                    or self.expert_quant)
+        return self.shared_expert_weights or self.expert_quant
+
     def expert_bytes(self, index: Optional[int] = None) -> int:
         """One routed expert, packed, block scales included."""
         moe = self.moe if index is None else self.moe_for_block(index)
         params = moe.expert_params() * self.hidden_size
-        return int(round(params * self.expert_quant.bytes_per_param))
+        return int(round(params
+                         * self._routed_expert_quant(index).bytes_per_param))
 
     def shared_expert_bytes(self, index: Optional[int] = None) -> int:
         moe = self.moe if index is None else self.moe_for_block(index)
-        return self.expert_bytes(index) * moe.n_shared_experts
+        params = moe.expert_params() * self.hidden_size
+        return int(round(params
+                         * self._shared_expert_quant(index).bytes_per_param
+                         * moe.n_shared_experts))
 
     def attention_bytes(self, layer: int = 0) -> int:
         params = self.attention.weight_params(self.hidden_size, layer)
@@ -771,7 +870,7 @@ class ModelProfile:
 
     def embedding_bytes(self) -> int:
         return int(round(self.vocab_size * self.hidden_size
-                         * DTYPE_BYTES["bf16"]))
+                         * self.io_spec.bytes_per_param))
 
     def lm_head_bytes(self) -> int:
         return self.embedding_bytes()
@@ -888,26 +987,27 @@ class ModelProfile:
         return int(params)
 
     def kv_cache_bytes_for_layer(self, layer: int, context_tokens: int,
-                                 dtype: str = "fp8") -> int:
+                                 dtype: Optional[str] = None) -> int:
         """Cache one layer holds for one sequence at this context length."""
         per_token = self.attention.kv_cache_bytes_per_token(dtype, layer)
         return context_tokens * per_token + self.attention.state_bytes(dtype,
                                                                        layer)
 
     def kv_read_bytes_for_layer(self, layer: int, context_tokens: int,
-                                dtype: str = "fp8") -> int:
+                                dtype: Optional[str] = None) -> int:
         """Cache one layer *reads* to decode one token.
 
         Equal to what it holds under dense attention, and far less under CSA.
         """
         return self.attention.kv_read_bytes(context_tokens, dtype, layer)
 
-    def kv_cache_bytes(self, context_tokens: int, dtype: str = "fp8") -> int:
+    def kv_cache_bytes(self, context_tokens: int,
+                       dtype: Optional[str] = None) -> int:
         return sum(self.kv_cache_bytes_for_layer(layer, context_tokens, dtype)
                    for layer in range(self.n_layers))
 
     def block_kv_bytes(self, index: int, context_tokens: int,
-                       dtype: str = "fp8") -> int:
+                       dtype: Optional[str] = None) -> int:
         """Cache block ``index`` holds, MTP heads included.
 
         An MTP head runs its own attention and so keeps its own cache; it is
@@ -916,7 +1016,7 @@ class ModelProfile:
         return self.kv_cache_bytes_for_layer(index, context_tokens, dtype)
 
     def block_kv_read_bytes(self, index: int, context_tokens: int,
-                            dtype: str = "fp8") -> int:
+                            dtype: Optional[str] = None) -> int:
         return self.kv_read_bytes_for_layer(index, context_tokens, dtype)
 
     def activation_bytes(self, dtype: str = "bf16") -> int:
@@ -1082,6 +1182,36 @@ DEEPSEEK_V4_1_FLASH = ModelProfile(
     source="deepseek-ai/DeepSeek-V4.1-Flash config.json",
 )
 
+#: LibertAIDAI's REAP-pruned forks of V4.1-Flash: the same checkpoint,
+#: quantisation, and top-6 routing with the routed-expert pool cut from 384
+#: to 256 or 272 (REAP removes the experts a calibration set least uses).
+#: Fewer experts is strictly a residency question — every read a token makes
+#: is the same size — so the derived profiles keep every other field.
+DEEPSEEK_V4_1_FLASH_REAP_256E = replace(
+    DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-reap-256e",
+    moe=replace(DEEPSEEK_V4_1_FLASH.moe, n_routed_experts=256),
+    source="LibertAIDAI/DeepSeek-V4.1-Flash-REAP-256E config.json")
+DEEPSEEK_V4_1_FLASH_REAP_272E = replace(
+    DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-reap-272e",
+    moe=replace(DEEPSEEK_V4_1_FLASH.moe, n_routed_experts=272),
+    source="LibertAIDAI/DeepSeek-V4.1-Flash-REAP-272E config.json")
+
+#: NVIDIA's NVFP4 build of V4.1-Flash. Its hf_quant_config.json quantizes
+#: *only* the routed experts — ``*.attn.*``, ``*.ffn.shared_experts.*``,
+#: ``head``, and ``mtp.*`` are all in the ignore list — so hot weights,
+#: i/o, the Engram tables, and the draft blocks stay bf16. The routed
+#: experts alone take NVFP4; the shared and draft experts are separate
+#: fields because the config quantizes them differently, not at all. A
+#: hypothetical all-linear NVFP4 build is a recipe, ``--weights-quant nvfp4
+#: --experts-quant nvfp4``, not this profile.
+DEEPSEEK_V4_1_FLASH_NVFP4 = replace(
+    DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-nvfp4",
+    weights=QUANT_SPECS["bf16"], expert_weights=NVFP4,
+    shared_expert_weights=QUANT_SPECS["bf16"],
+    draft_expert_weights=QUANT_SPECS["bf16"],
+    source="nvidia/DeepSeek-V4.1-Flash-NVFP4 hf_quant_config.json")
+
+
 #: A small MoE with the same architecture, for a fleet of two or three consoles
 #: and for CI. Not a real checkpoint; a shape.
 DEEPSEEK_TINY = ModelProfile(
@@ -1099,9 +1229,61 @@ DEEPSEEK_TINY = ModelProfile(
     n_mtp_heads=0,
 )
 
+
+def with_quant(profile: ModelProfile, *,
+               weights: Optional[QuantSpec] = None,
+               expert_weights: Optional[QuantSpec] = None,
+               shared_expert_weights: Optional[QuantSpec] = None,
+               draft_expert_weights: Optional[QuantSpec] = None,
+               io_quant: Optional[QuantSpec] = None,
+               kv_quant: Optional[QuantSpec] = None,
+               index_quant: Optional[QuantSpec] = None,
+               name: Optional[str] = None) -> ModelProfile:
+    """A copy of ``profile`` re-packed in different quantisations.
+
+    Community checkpoints are recipes rather than formats — a GGUF build is
+    typically q6_k hot weights over q2_k experts with the i/o tensors at
+    their own rate, an NVFP4 build one format throughout. The planner only
+    needs the byte rates, and every piece already sizes off the spec it
+    lives under, so a recipe is just swapping the fields. ``kv_quant`` and
+    ``index_quant`` reach into the attention config; a spec a profile has
+    no field for is left alone. One subtlety: an unset ``expert_weights``
+    keeps inheriting ``weights``, so holding the experts at their current
+    rate while repacking hot weights means passing it explicitly — the
+    ``--*-quant`` CLI flags pin it on the caller's behalf.
+    """
+    updated = profile
+    if weights is not None:
+        updated = replace(updated, weights=weights)
+    if expert_weights is not None:
+        updated = replace(updated, expert_weights=expert_weights)
+    if shared_expert_weights is not None:
+        updated = replace(updated,
+                          shared_expert_weights=shared_expert_weights)
+    if draft_expert_weights is not None:
+        updated = replace(updated,
+                          draft_expert_weights=draft_expert_weights)
+    if io_quant is not None:
+        updated = replace(updated, io_quant=io_quant)
+    if name is not None:
+        updated = replace(updated, name=name)
+    attention = updated.attention
+    if kv_quant is not None and isinstance(
+            attention, (MLAConfig, HybridAttentionConfig, CSA2Config)):
+        attention = replace(attention, kv_quant=kv_quant)
+    if index_quant is not None and isinstance(
+            attention, (HybridAttentionConfig, CSA2Config)):
+        attention = replace(attention, index_quant=index_quant)
+    if attention is not updated.attention:
+        updated = replace(updated, attention=attention)
+    return updated
+
+
 PROFILES: Dict[str, ModelProfile] = {
     p.name: p for p in (DEEPSEEK_V3, DEEPSEEK_V4_PRO, DEEPSEEK_V4_FLASH,
-                        DEEPSEEK_V4_1_FLASH, DEEPSEEK_TINY)
+                        DEEPSEEK_V4_1_FLASH, DEEPSEEK_V4_1_FLASH_REAP_256E,
+                        DEEPSEEK_V4_1_FLASH_REAP_272E,
+                        DEEPSEEK_V4_1_FLASH_NVFP4, DEEPSEEK_TINY)
 }
 
 

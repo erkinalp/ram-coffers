@@ -93,7 +93,7 @@ class TestSelection(unittest.TestCase):
 
     def test_an_unavailable_gpu_backend_falls_back_visibly(self):
         runner = select_runner("vulkan")
-        self.assertIn(runner.name, {"cpu-avx2", "numpy"})
+        self.assertIn(runner.name, {"cpu-avx2", "numpy", "numpy-reference"})
 
     def test_probe_reports_each_backend(self):
         text = "\n".join(describe_backends())

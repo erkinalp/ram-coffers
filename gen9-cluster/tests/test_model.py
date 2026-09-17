@@ -1,12 +1,19 @@
 """Model sizing: the arithmetic that decides how many consoles are needed."""
 
+import argparse
 import dataclasses
 import unittest
 
+from gen9_cluster.cli import _profile_for_args
+
 from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_1_FLASH,
+                                DEEPSEEK_V4_1_FLASH_NVFP4,
+                                DEEPSEEK_V4_1_FLASH_REAP_256E,
+                                DEEPSEEK_V4_1_FLASH_REAP_272E,
                                 DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO,
-                                FP4_E4M3_16, FP8_UE8M0_32, MXFP4, PROFILES,
-                                profile_for)
+                                FP4_E4M3_16, FP8_UE8M0_32, GGUF_Q2_K, GGUF_Q6_K,
+                                GGUF_Q8_0, MXFP4, NVFP4, PROFILES, QUANT_SPECS,
+                                QuantSpec, profile_for, with_quant)
 
 GB = 1024 ** 3
 MB = 1024 ** 2
@@ -366,6 +373,146 @@ class TestPlanningLayers(unittest.TestCase):
                  + DEEPSEEK_V4_PRO.cold_bytes_per_moe_layer())
         mtp = DEEPSEEK_V4_PRO.mtp_bytes() / DEEPSEEK_V4_PRO.n_mtp_heads
         self.assertGreater(mtp, layer * 0.5)
+
+
+class TestQuantisedForms(unittest.TestCase):
+    """Community checkpoints are recipes on the same arithmetic: the planner
+    needs exact byte rates per format and a way to swap them per piece."""
+
+    def test_gguf_specs_carry_the_exact_superblock_rates(self):
+        """The q*_k formats pack their scales inside the block: 144 B per 256
+        for q4_k, 84 for q2_k, 210 for q6_k, and 34 B per 32 for q8_0."""
+        self.assertEqual(QUANT_SPECS["gguf-q4_k"].bytes_per_param, 0.5625)
+        self.assertEqual(QUANT_SPECS["gguf-q2_k"].bytes_per_param, 0.328125)
+        self.assertEqual(QUANT_SPECS["gguf-q6_k"].bytes_per_param, 0.8203125)
+        self.assertEqual(QUANT_SPECS["gguf-q8_0"].bytes_per_param, 1.0625)
+
+    def test_nvfp4_packs_like_the_e4m3_scale_per_16_format(self):
+        """NVFP4 is E2M1 values + an E4M3 scale per 16 + a tensor-level fp32
+        scale; that last term is ~4 B over millions of params, so the planner
+        uses the same 0.5625 figure it already models for the KV cache. The
+        dtype is still distinct: the wire has to carry the tensor scale, so
+        the spec names its own format."""
+        self.assertEqual(NVFP4.bytes_per_param, 0.5625)
+        self.assertEqual(NVFP4.bytes_per_param, FP4_E4M3_16.bytes_per_param)
+        self.assertNotEqual(NVFP4, FP4_E4M3_16)
+        self.assertEqual(NVFP4.dtype, "nvfp4")
+
+    def test_the_nvfp4_checkpoint_quantizes_only_the_routed_experts(self):
+        """nvidia's hf_quant_config.json lists only ``layers.*.ffn.experts``
+        as NVFP4 — attention, shared experts, mtp, and head are all in the
+        ignore list — so the profile is experts-NVFP4 over a bf16 backbone,
+        not an all-linear repack."""
+        profile = DEEPSEEK_V4_1_FLASH_NVFP4
+        self.assertEqual(profile.expert_quant, NVFP4)
+        self.assertEqual(profile.weights, QUANT_SPECS["bf16"])
+        self.assertEqual(profile.io_spec, QUANT_SPECS["bf16"])
+        # The shared and draft experts are in the config's ignore list, so
+        # they price at bf16 — routing them through the routed-expert format
+        # would undercount residency by ~20 GiB.
+        self.assertEqual(profile.shared_expert_weights, QUANT_SPECS["bf16"])
+        self.assertEqual(profile.draft_expert_weights, QUANT_SPECS["bf16"])
+        draft = profile.n_layers  # the first draft block's index
+        params = profile.moe.expert_params() * profile.hidden_size
+        draft_params = profile.draft_moe.expert_params() * profile.hidden_size
+        self.assertEqual(profile.shared_expert_bytes(0),
+                         int(round(params * 2.0)))
+        self.assertEqual(profile.shared_expert_bytes(draft),
+                         int(round(draft_params * 2.0)))
+        self.assertEqual(profile.expert_bytes(draft),
+                         int(round(draft_params * 2.0)))
+        self.assertEqual(profile.expert_bytes(0),
+                         int(round(params * 0.5625)))
+        self.assertGreater(profile.total_bytes(),
+                           DEEPSEEK_V4_1_FLASH.total_bytes())
+
+    def test_with_quant_repacks_the_pieces_it_names(self):
+        repacked = with_quant(DEEPSEEK_V4_1_FLASH, weights=GGUF_Q6_K,
+                              expert_weights=GGUF_Q2_K, kv_quant=GGUF_Q6_K,
+                              index_quant=GGUF_Q6_K)
+        self.assertEqual(repacked.weights, GGUF_Q6_K)
+        self.assertEqual(repacked.expert_quant, GGUF_Q2_K)
+        # The shared KV pools live on the attention config, which is frozen:
+        # the recipe has to replace it, not mutate it.
+        self.assertEqual(repacked.attention.kv_quant, GGUF_Q6_K)
+        self.assertEqual(repacked.attention.index_quant, GGUF_Q6_K)
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.weights, FP8_UE8M0_32)
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.attention.kv_quant, FP4_E4M3_16)
+        # A mixed recipe changes residency, not shape.
+        self.assertEqual(repacked.total_params(),
+                         DEEPSEEK_V4_1_FLASH.total_params())
+        self.assertLess(repacked.total_bytes(),
+                        DEEPSEEK_V4_1_FLASH.total_bytes())
+
+    def test_reap_profiles_keep_everything_but_the_expert_count(self):
+        """LibertAIDAI's REAP builds prune the routed pool — 256 or 272 of 384
+        — and change nothing else: same FP8/FP4 packing, same top-6."""
+        for profile, kept in ((DEEPSEEK_V4_1_FLASH_REAP_256E, 256),
+                              (DEEPSEEK_V4_1_FLASH_REAP_272E, 272)):
+            self.assertEqual(profile.moe.n_routed_experts, kept)
+            self.assertEqual(profile.moe.top_k, 6)
+            self.assertEqual(profile.weights, FP8_UE8M0_32)
+            self.assertEqual(profile.expert_quant, MXFP4)
+            self.assertLess(profile.total_bytes(),
+                            DEEPSEEK_V4_1_FLASH.total_bytes())
+        self.assertIn("deepseek-v4.1-flash-reap-256e", PROFILES)
+        self.assertIn("deepseek-v4.1-flash-reap-272e", PROFILES)
+
+    def test_io_quant_repacks_the_embedding_and_lm_head(self):
+        """GGUF recipes keep i/o tensors at their own rate — usually finer
+        than the experts' — so it is its own knob, not part of ``weights``."""
+        repacked = with_quant(DEEPSEEK_V4_1_FLASH, io_quant=GGUF_Q8_0)
+        expect = int(round(DEEPSEEK_V4_1_FLASH.vocab_size
+                           * DEEPSEEK_V4_1_FLASH.hidden_size * 1.0625))
+        self.assertEqual(repacked.embedding_bytes(), expect)
+        self.assertEqual(repacked.lm_head_bytes(), expect)
+        # ...while the default remains the checkpoints' bf16.
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.io_spec, QUANT_SPECS["bf16"])
+        self.assertEqual(DEEPSEEK_V4_1_FLASH.embedding_bytes(),
+                         int(round(DEEPSEEK_V4_1_FLASH.vocab_size
+                                   * DEEPSEEK_V4_1_FLASH.hidden_size * 2.0)))
+
+    def test_the_cli_pins_experts_when_only_weights_are_repacked(self):
+        """``--weights-quant`` alone repacks the hot weights, not the experts:
+        profiles that store both in one format (V3) keep their expert rate,
+        while ``with_quant`` keeps its field-swap semantics — unset
+        ``expert_weights`` still inherits ``weights``."""
+        args = argparse.Namespace(model="deepseek-v3",
+                                  weights_quant="gguf-q6_k",
+                                  experts_quant=None, io_quant=None,
+                                  kv_quant=None)
+        repacked = _profile_for_args(args)
+        self.assertEqual(repacked.weights, GGUF_Q6_K)
+        self.assertEqual(repacked.expert_quant, DEEPSEEK_V3.expert_quant)
+        # ...while a direct field swap on a uniform profile moves both.
+        inherited = with_quant(DEEPSEEK_V3, weights=GGUF_Q6_K)
+        self.assertEqual(inherited.expert_quant, GGUF_Q6_K)
+
+    def test_kv_quant_reaches_every_attention_kind(self):
+        """MLA and Hybrid both store their caches under ``kv_quant`` now —
+        before, a recipe could only reach CSA2's pool."""
+        fp32 = QuantSpec("fp32")
+        v3 = with_quant(DEEPSEEK_V3, kv_quant=fp32)
+        mla = v3.attention
+        per_token = mla.kv_lora_rank * 4.0 + mla.qk_rope_head_dim * 2.0
+        self.assertEqual(mla.kv_cache_bytes_per_token(), int(round(per_token)))
+        self.assertGreater(v3.kv_cache_bytes(8192),
+                           DEEPSEEK_V3.kv_cache_bytes(8192))
+        # Hybrid too: the whole entry repacks, not just the index pool.
+        v4 = with_quant(DEEPSEEK_V4_FLASH, kv_quant=fp32)
+        hybrid = v4.attention
+        entry = ((hybrid.head_dim - hybrid.qk_rope_head_dim) * 4.0
+                 + hybrid.qk_rope_head_dim * 2.0)
+        self.assertEqual(hybrid.kv_entry_bytes(), entry)
+        # ...and an explicit dtype still wins over the configured spec.
+        self.assertEqual(hybrid.kv_entry_bytes("fp8"),
+                         DEEPSEEK_V4_FLASH.attention.kv_entry_bytes())
+
+    def test_named_lookup_finds_the_quantised_variants(self):
+        self.assertIs(profile_for("deepseek-v4.1-flash-reap-256e"),
+                      DEEPSEEK_V4_1_FLASH_REAP_256E)
+        self.assertIs(profile_for("deepseek-v4.1-flash-nvfp4"),
+                      DEEPSEEK_V4_1_FLASH_NVFP4)
 
 
 class TestProfileRegistry(unittest.TestCase):

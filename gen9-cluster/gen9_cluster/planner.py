@@ -55,6 +55,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .hardware import (BANDWIDTH_EFFICIENCY, GB, MB, ConsoleUnit,
                        EffectiveCapability)
 from .model import EngramConfig, ModelProfile, QuantSpec
+from .protocol import DType
 
 #: A weight read every token belongs in a coffer at least this fast. Below it,
 #: the hot block alone would dominate the layer's time budget. Chosen just under
@@ -92,6 +93,9 @@ class ExpertShard:
     unit_id: str
     #: "fast" | "slow" | "ssd" — which coffer holds them.
     tier: str
+    #: The wire ``DType`` name the shard's bytes travel and load under, so a
+    #: coordinator can build the ``LOAD_SHARD`` header from the record alone.
+    dtype: str = "FP32"
 
     @property
     def expert_ids(self) -> range:
@@ -100,7 +104,7 @@ class ExpertShard:
     def to_dict(self) -> Dict[str, object]:
         return {"layer": self.layer, "first_expert": self.first_expert,
                 "n_experts": self.n_experts, "unit_id": self.unit_id,
-                "tier": self.tier}
+                "tier": self.tier, "dtype": self.dtype}
 
 
 @dataclass
@@ -122,11 +126,14 @@ class EngramRowShard:
     byte_count: int
     #: "ram" | "ssd" — which tier holds the rows.
     tier: str
+    #: The wire ``DType`` name the rows are packed in (the model's ``weights``
+    #: format, which is what every Engram build ships them at).
+    dtype: str = "FP32"
 
     def to_dict(self) -> Dict[str, object]:
         return {"layer": self.layer, "first_row": self.first_row,
                 "n_rows": self.n_rows, "bytes": self.byte_count,
-                "tier": self.tier}
+                "tier": self.tier, "dtype": self.dtype}
 
 
 @dataclass
@@ -232,6 +239,9 @@ class SplitPlan:
     seconds_per_token: float = 0.0
     ssd_expert_bytes: int = 0
     active_units_per_token: int = 0
+    #: Piece-role -> wire ``DType`` name, so a loader reconstructs every
+    #: format from the plan alone rather than re-parsing ``model``.
+    formats: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
     @property
@@ -252,6 +262,7 @@ class SplitPlan:
             "seconds_per_token": self.seconds_per_token,
             "ssd_expert_bytes": self.ssd_expert_bytes,
             "active_units_per_token": self.active_units_per_token,
+            "formats": dict(self.formats),
             "warnings": list(self.warnings),
         }
 
@@ -343,6 +354,7 @@ def plan_split(profile: ModelProfile, fleet: Sequence[ConsoleUnit], *,
 
     sec, active = _estimate_decode(profile, caps, units, stages, hop_seconds,
                                    context_tokens)
+    formats = _wire_formats(profile)
     ssd_bytes = sum(u.ssd_expert_bytes for u in units.values())
     if ssd_bytes:
         warnings.append(
@@ -356,7 +368,38 @@ def plan_split(profile: ModelProfile, fleet: Sequence[ConsoleUnit], *,
         feasible=True, shortfall_bytes=0,
         tokens_per_second=(1.0 / sec if sec > 0 else 0.0),
         seconds_per_token=sec, ssd_expert_bytes=ssd_bytes,
-        active_units_per_token=active, warnings=warnings)
+        active_units_per_token=active, formats=formats,
+        warnings=warnings)
+
+
+def _wire_formats(profile: ModelProfile) -> Dict[str, str]:
+    """Piece-role -> wire ``DType`` name: the plan's format ledger.
+
+    Expert and Engram shard records carry their own ``dtype``, so this names
+    the pieces that load without a per-piece record — hot weights (and the
+    Engram tables, which ship at the same format), the i/o tensors, and the
+    cache pools — plus the expert pools as a summary of what the shard
+    records hold per block kind. A coordinator builds every ``LOAD_SHARD``
+    header from the plan alone, never by re-parsing the recipe in
+    ``profile.name``.
+    """
+    formats = {
+        "weights": DType.for_spec(profile.weights).name,
+        "io": DType.for_spec(profile.io_spec).name,
+        "routed_experts": DType.for_spec(
+            profile._routed_expert_quant(0)).name,
+        "shared_experts": DType.for_spec(
+            profile._shared_expert_quant(0)).name,
+    }
+    for pool, spec in profile.attention.cache_specs().items():
+        formats[pool] = DType.for_spec(spec).name
+    if profile.draft_moe is not None:
+        draft = profile.n_layers
+        formats["draft_routed_experts"] = DType.for_spec(
+            profile._routed_expert_quant(draft)).name
+        formats["draft_shared_experts"] = DType.for_spec(
+            profile._shared_expert_quant(draft)).name
+    return formats
 
 
 # -- shelves ---------------------------------------------------------------
@@ -548,6 +591,8 @@ def _assign_experts(profile: ModelProfile,
                 continue
             moe = profile.moe_for_block(layer)
             expert = profile.expert_bytes(layer)
+            expert_dtype = DType.for_spec(
+                profile._routed_expert_quant(layer)).name
             remaining = moe.n_routed_experts
             first = 0
             shares = _shelf_shares(profile, shelf, units, moe)
@@ -560,7 +605,8 @@ def _assign_experts(profile: ModelProfile,
                     continue
                 take = int(max(1, min(remaining, free // expert, shares[uid])))
                 tier = _tier_for(caps[uid], plan, take * expert)
-                plan.shards.append(ExpertShard(layer, first, take, uid, tier))
+                plan.shards.append(ExpertShard(layer, first, take, uid, tier,
+                                               expert_dtype))
                 if tier == "fast":
                     plan.fast_expert_bytes += take * expert
                 else:
@@ -570,8 +616,9 @@ def _assign_experts(profile: ModelProfile,
             if remaining <= 0:
                 continue
             if allow_ssd_tier:
-                placed = _place_on_ssd(layer, first, remaining, expert, shelf,
-                                       stage, caps, units)
+                placed = _place_on_ssd(layer, first, remaining, expert,
+                                       expert_dtype, shelf, stage, caps,
+                                       units)
                 first += placed
                 remaining -= placed
             if remaining <= 0:
@@ -587,7 +634,8 @@ def _assign_experts(profile: ModelProfile,
                 if take <= 0:
                     continue
                 tier = _tier_for(caps[uid], plan, take * expert)
-                plan.shards.append(ExpertShard(layer, first, take, uid, tier))
+                plan.shards.append(ExpertShard(layer, first, take, uid, tier,
+                                               expert_dtype))
                 if tier == "fast":
                     plan.fast_expert_bytes += take * expert
                 else:
@@ -631,7 +679,7 @@ def _tier_for(cap: EffectiveCapability, plan: UnitPlan, want: int) -> str:
 
 
 def _place_on_ssd(layer: int, first: int, count: int, expert_bytes: int,
-                  shelf: Sequence[str], stage: StagePlan,
+                  expert_dtype: str, shelf: Sequence[str], stage: StagePlan,
                   caps: Dict[str, EffectiveCapability],
                   units: Dict[str, UnitPlan]) -> int:
     """Put the remainder of a layer's experts on shelf-local NVMe.
@@ -652,7 +700,8 @@ def _place_on_ssd(layer: int, first: int, count: int, expert_bytes: int,
         take = min(count - placed, max(0, room // expert_bytes))
         if take <= 0:
             continue
-        plan.shards.append(ExpertShard(layer, first + placed, take, uid, "ssd"))
+        plan.shards.append(ExpertShard(layer, first + placed, take, uid, "ssd",
+                                       expert_dtype))
         plan.ssd_expert_bytes += take * expert_bytes
         placed += take
     return placed
@@ -784,7 +833,8 @@ def _assign_io(profile: ModelProfile, caps: Dict[str, EffectiveCapability],
             target.engram_shards.append(EngramRowShard(
                 layer=layer_id, first_row=0,
                 n_rows=profile.engram.num_embeddings[table],
-                byte_count=rows, tier="ssd"))
+                byte_count=rows, tier="ssd",
+                dtype=DType.for_spec(profile.weights).name))
     return unplaced
 
 
@@ -826,7 +876,8 @@ def _place_engram_ram(table: int, layer_id: int, engram: EngramConfig,
         unit = units[uid]
         unit.engram_shards.append(EngramRowShard(
             layer=layer_id, first_row=first_row, n_rows=take,
-            byte_count=byte_count, tier="ram"))
+            byte_count=byte_count, tier="ram",
+            dtype=DType.for_spec(quant).name))
         unit.engram_rows[layer_id] = (unit.engram_rows.get(layer_id, 0)
                                       + byte_count)
         unit.io_pieces.append(f"engram-{layer_id}-rows")

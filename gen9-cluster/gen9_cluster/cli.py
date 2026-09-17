@@ -26,7 +26,8 @@ from .backends import describe_backends, select_runner
 from .hardware import GB, fleet_summary, SKUS
 from .inventory import (addresses, deployment_config, load_fleet,
                         save_fleet, synthetic_fleet, units)
-from .model import PROFILES, describe, profile_for
+from .model import (PROFILES, QUANT_SPECS, ModelProfile, describe,
+                    profile_for, with_quant)
 from .planner import PlanningError, describe_plan, plan_split
 
 
@@ -42,6 +43,51 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
                         help="refuse to place experts on NVMe")
     parser.add_argument("--hop-ms", type=float, default=0.25,
                         help="one-way network hop, in milliseconds")
+    parser.add_argument("--weights-quant", choices=sorted(QUANT_SPECS),
+                        default=None,
+                        help="re-pack the profile's hot weights in this "
+                             "format before planning")
+    parser.add_argument("--experts-quant", choices=sorted(QUANT_SPECS),
+                        default=None,
+                        help="re-pack the routed experts in this format")
+    parser.add_argument("--io-quant", choices=sorted(QUANT_SPECS),
+                        default=None,
+                        help="re-pack the embedding and LM-head tensors")
+    parser.add_argument("--kv-quant", choices=sorted(QUANT_SPECS),
+                        default=None,
+                        help="re-pack the KV cache (and its index pool)")
+
+
+def _profile_for_args(args: argparse.Namespace) -> ModelProfile:
+    """The requested profile, repacked if any ``--*-quant`` flags were given."""
+    profile = profile_for(args.model)
+    # ``--weights-quant`` alone must not sweep the experts up with it:
+    # profiles that store hot and expert weights in one format (V3, tiny)
+    # pin their original expert rate unless ``--experts-quant`` says more.
+    expert_weights = (QUANT_SPECS[args.experts_quant]
+                      if args.experts_quant else
+                      (profile.expert_quant if args.weights_quant else None))
+    # A repacked checkpoint is not the checkpoint: the recipe goes in the
+    # profile's name so plans, deployment metadata, and fleet configs can
+    # tell two quantised placements of the same base apart.
+    note = _quant_note(args)
+    return with_quant(
+        profile,
+        weights=(QUANT_SPECS[args.weights_quant]
+                 if args.weights_quant else None),
+        expert_weights=expert_weights,
+        io_quant=(QUANT_SPECS[args.io_quant] if args.io_quant else None),
+        kv_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None),
+        index_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None),
+        name=f"{profile.name}~{note.replace(', ', ',')}" if note else None)
+
+
+def _quant_note(args: argparse.Namespace) -> str:
+    parts = [("weights", getattr(args, "weights_quant", None)),
+             ("experts", getattr(args, "experts_quant", None)),
+             ("io", getattr(args, "io_quant", None)),
+             ("kv", getattr(args, "kv_quant", None))]
+    return ", ".join(f"{k}={v}" for k, v in parts if v)
 
 
 def cmd_model(args: argparse.Namespace) -> int:
@@ -53,7 +99,7 @@ def cmd_model(args: argparse.Namespace) -> int:
 
 def cmd_size(args: argparse.Namespace) -> int:
     """Answer "how many consoles?" before anyone has bought any."""
-    profile = profile_for(args.model)
+    profile = _profile_for_args(args)
     given = vars(args)
     counts = {sku: given.get(sku.replace("-", "_")) or 0 for sku in SKUS}
     counts = {sku: n for sku, n in counts.items() if n}
@@ -62,9 +108,11 @@ def cmd_size(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     fleet = synthetic_fleet(counts)
+    note = _quant_note(args)
     print(f"total weights: {profile.total_bytes() / GB:.1f} GiB "
           f"({profile.name}"
-          + (", ASSUMED CONFIGURATION" if profile.assumed else "") + ")")
+          + (", ASSUMED CONFIGURATION" if profile.assumed else "")
+          + (f", repacked: {note}" if note else "") + ")")
     print("\n".join(_fleet_capacity_lines(fleet)))
     try:
         plan = plan_split(profile, units(fleet), context_tokens=args.context,
@@ -92,7 +140,7 @@ def _fleet_capacity_lines(fleet) -> List[str]:
 
 def cmd_plan(args: argparse.Namespace) -> int:
     fleet = load_fleet(Path(args.fleet))
-    profile = profile_for(args.model)
+    profile = _profile_for_args(args)
     try:
         plan = plan_split(profile, units(fleet), context_tokens=args.context,
                           shelf_size=args.shelf_size,
@@ -198,9 +246,11 @@ def cmd_health(args: argparse.Namespace) -> int:
     from .coordinator import FleetCoordinator
 
     fleet = load_fleet(Path(args.fleet))
-    profile = profile_for(args.model)
+    profile = _profile_for_args(args)
     plan = plan_split(profile, units(fleet), context_tokens=args.context,
-                      shelf_size=args.shelf_size)
+                      shelf_size=args.shelf_size,
+                      allow_ssd_tier=not args.no_ssd,
+                      hop_seconds=args.hop_ms / 1000.0)
 
     def router(layer, state):
         k = profile.moe.top_k

@@ -111,3 +111,47 @@ def quantize(values: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 def n_blocks(count: int) -> int:
     """How many block scales ``count`` values need."""
     return (count + BLOCK - 1) // BLOCK
+
+
+def decode_ue8m0(codes: np.ndarray) -> np.ndarray:
+    """UE8M0 exponent bytes to fp32.
+
+    The newer checkpoints store each tile scale as a single exponent byte —
+    2**(e - 127) — rather than an fp32. Decoding at load (this function) is a
+    lossless four-byte upcast, so it happens once rather than per token.
+    0xFF is the format's NaN.
+    """
+    u8 = np.asarray(codes, dtype=np.uint8).reshape(-1)
+    values = np.ldexp(np.ones(u8.size, dtype=np.float32),
+                      u8.astype(np.int16) - 127)
+    return np.where(u8 == 0xFF, np.float32(np.nan), values)
+
+
+def dequantize_tiled(codes: np.ndarray, scales: np.ndarray,
+                     tile: Tuple[int, int]) -> np.ndarray:
+    """Decode FP8 whose scales tile the 2-D matrix rather than its flat run.
+
+    ``codes`` is a matrix; ``tile`` is the (rows, cols) one scale covers —
+    128x128 in the classic ``weight_scale_inv`` layout, 32x32 in V4.1's.
+    ``scales`` is the tile grid, row-major, already at fp32. Edge tiles
+    partial in either dimension are handled by decoding into a padded buffer
+    and cropping back, so no dimension need divide the tile.
+    """
+    tile_rows, tile_cols = tile
+    rows, cols = np.shape(codes)
+    n_tr = (rows + tile_rows - 1) // tile_rows
+    n_tc = (cols + tile_cols - 1) // tile_cols
+    scale_grid = np.asarray(scales, dtype=np.float32).reshape(n_tr, n_tc)
+    padded = np.zeros((n_tr * tile_rows, n_tc * tile_cols), dtype=np.float32)
+    padded[:rows, :cols] = decode(codes)
+    blocked = padded.reshape(n_tr, tile_rows, n_tc, tile_cols)
+    out = blocked * scale_grid[:, None, :, None]
+    return out.reshape(n_tr * tile_rows, n_tc * tile_cols)[:rows, :cols]
+
+
+def tile_scales_needed(shape: Tuple[int, ...],
+                       tile: Tuple[int, int]) -> int:
+    """How many scales a ``shape`` matrix needs at ``tile`` geometry."""
+    tile_rows, tile_cols = tile
+    return (((shape[0] + tile_rows - 1) // tile_rows)
+            * ((shape[1] + tile_cols - 1) // tile_cols))

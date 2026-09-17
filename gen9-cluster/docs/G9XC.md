@@ -20,9 +20,11 @@ node returns `gate_i * expert_i(x)` for each expert it was asked for, tagged
 with the expert id, and the coordinator adds them in the router's top-k order.
 See [Reproducibility](#reproducibility) for why, and `FAST` for the way out.
 
-**Weights are FP8 with block scales.** The dtype field names
-`fp8-e4m3-b128` and a `LOAD_SHARD` carrying it also carries its scales, so a
-shard ships in the format the checkpoint already uses and is never materialised
+**Weights travel in their shipped format.** The dtype field names the
+encoding a `LOAD_SHARD` carries — `fp8-e4m3-b128` with its scale array, one of
+the block-packed formats (the GGUF superblocks q8_0 through q6_k, mxfp4, or
+fp4-e4m3-16) whose scales live inside the blocks, or a plain dense fp32/fp16/
+bf16 — so a shard ships the way the checkpoint uses and is never materialised
 at fp32 on the way.
 
 **Little-endian.** P3XC was big-endian because the Cell's PPE was. Every console
@@ -159,9 +161,9 @@ u16  tier_len
      tier                ascii: "fast" | "slow" | "ssd"
 ```
 
-followed by the body. For `FP32`, the body is
-`n_experts × 3 × hidden × intermediate` little-endian floats, in gate, up, down
-order per expert.
+followed by the body. For the dense dtypes (`FP32`, `FP16`, `BF16`) the body
+is `n_experts × 3 × hidden × intermediate` elements of the named width, in
+gate, up, down order per expert; the node decodes them to fp32 at load.
 
 For `FP8_E4M3_B128` the body is **all codes, then all block scales**:
 
@@ -176,6 +178,27 @@ memory-mapped shard reads them without a gather. The scales are three orders of
 magnitude smaller and can afford to be a second, small transfer. A body of the
 wrong length is refused with `ERROR` — a shard whose scales are missing would
 otherwise decode to plausible-looking noise.
+
+For the **packed dtypes** (`MXFP4`, `FP4_E4M3_16`, `NVFP4`, and the `GGUF_*`
+superblock formats) the body is again gate, up, down per expert, but every
+matrix row is a run of self-contained blocks with their scales interleaved —
+no separate scale section. `hidden` and `intermediate` must divide the
+format's block width (256 for the K-quants, 64 for fp4/nvfp4, 32 for
+mxfp4/q8_0); a shape that cannot be cut into whole blocks is refused rather
+than decoded wrong. `NVFP4` alone appends a 4-byte fp32 *tensor* scale after
+each matrix's blocks — the checkpoint's global scale factor is part of the
+encoding, not metadata a loader may drop. The node keeps the bytes packed —
+the whole point of these formats is the footprint — and dequantises per use,
+which is slow in exactly the way `dequantised()` warns about.
+
+For the **tile-scaled FP8 dtypes** (`FP8_E4M3_T128`, `FP8_E4M3_T128_UE8M0`,
+`FP8_E4M3_T32_UE8M0`) the body is codes-then-scales like `FP8_E4M3_B128`, but
+one scale covers a 2-D tile of the matrix — 128x128 or 32x32, named by the
+dtype — rather than 128 flat elements, and the scale itself is fp32 or a
+one-byte ue8m0 exponent as the code says. This is the layout the stock
+checkpoints actually ship (`weight_scale_inv` and its newer exponent
+variants); sending those bytes under `FP8_E4M3_B128` fails the loader's
+length contract on purpose rather than decoding to plausible noise.
 
 ### `HelloPayload`
 

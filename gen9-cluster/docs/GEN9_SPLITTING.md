@@ -158,6 +158,37 @@ just rescaling.
   planner sizes their hot and cold sides by the draft config, not the
   backbone's 384/top-6.
 
+## Quantised forks
+
+The HF community already ships V4.1 in cheaper formats, and the only planning
+question they change is how many consoles the residency fits on — the
+arithmetic itself is untouched, because every piece in the plan already sizes
+off the `QuantSpec` it lives under. Three shapes of fork exist:
+
+- **A repack.** NVIDIA's NVFP4 build quantizes only the routed experts —
+  attention, shared experts, MTP, head, and embeddings stay bf16 in its
+  `hf_quant_config.json` — so `deepseek-v4.1-flash-nvfp4` is experts-NVFP4
+  over a bf16 backbone, with shared and draft experts priced at bf16 too
+  (floor 63 RAM-only; an all-linear NVFP4 repack is a recipe instead,
+  `--weights-quant nvfp4 --experts-quant nvfp4`).
+- **A recipe.** GGUF/EXL3/MLX builds mix formats per tensor class — q6_k over
+  q2_k is the usual shape — so they compose at plan time via `with_quant`
+  or the `--weights-quant`/`--experts-quant`/`--io-quant`/`--kv-quant` flags
+  rather than as a named profile. Embeddings and the LM head take `--io-quant`
+  (recipes keep them finer than experts); the Engram tables follow `weights`,
+  which is what the builds do to embedding-type tensors anyway.
+- **A pruning.** REAP cuts the routed pool to 256 or 272 of 384 experts and
+  changes nothing else; `deepseek-v4.1-flash-reap-*` are derived profiles
+  with the smaller `n_routed_experts` and floors of 35/36 RAM-only.
+
+The runtime carries the same formats the planner names: `LOAD_SHARD` takes
+the GGUF superblocks, mxfp4 and fp4 as block-packed bodies
+(`gen9_cluster/quants.py` decodes them to fp32 per use, scales packed inside
+each block), nvfp4 appends its tensor-level fp32 scale after each matrix,
+the FP8 tile-scale layouts the checkpoints ship ride their own wire codes,
+and `DType.for_spec` maps each spec — scale geometry included — onto its
+encoding.
+
 The floor drops from 83 PS5s (V4 Pro, RAM-only) to **43** — the ~183 GiB of
 Engram rows shard across fleet RAM when no drives are allowed — and to **24**
 with the SSD tier on, one more than V4 Pro's 23.
