@@ -1197,7 +1197,10 @@ def with_quant(profile: ModelProfile, *,
     needs the byte rates, and every piece already sizes off the spec it
     lives under, so a recipe is just swapping the fields. ``kv_quant`` and
     ``index_quant`` reach into the attention config; a spec a profile has
-    no field for is left alone.
+    no field for is left alone. One subtlety: an unset ``expert_weights``
+    keeps inheriting ``weights``, so holding the experts at their current
+    rate while repacking hot weights means passing it explicitly — the
+    ``--*-quant`` CLI flags pin it on the caller's behalf.
     """
     updated = profile
     if weights is not None:

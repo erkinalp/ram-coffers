@@ -60,12 +60,18 @@ def _add_plan_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _profile_for_args(args: argparse.Namespace) -> ModelProfile:
     """The requested profile, repacked if any ``--*-quant`` flags were given."""
+    profile = profile_for(args.model)
+    # ``--weights-quant`` alone must not sweep the experts up with it:
+    # profiles that store hot and expert weights in one format (V3, tiny)
+    # pin their original expert rate unless ``--experts-quant`` says more.
+    expert_weights = (QUANT_SPECS[args.experts_quant]
+                      if args.experts_quant else
+                      (profile.expert_quant if args.weights_quant else None))
     return with_quant(
-        profile_for(args.model),
+        profile,
         weights=(QUANT_SPECS[args.weights_quant]
                  if args.weights_quant else None),
-        expert_weights=(QUANT_SPECS[args.experts_quant]
-                        if args.experts_quant else None),
+        expert_weights=expert_weights,
         io_quant=(QUANT_SPECS[args.io_quant] if args.io_quant else None),
         kv_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None),
         index_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None))

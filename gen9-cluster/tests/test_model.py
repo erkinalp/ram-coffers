@@ -1,7 +1,10 @@
 """Model sizing: the arithmetic that decides how many consoles are needed."""
 
+import argparse
 import dataclasses
 import unittest
+
+from gen9_cluster.cli import _profile_for_args
 
 from gen9_cluster.model import (DEEPSEEK_TINY, DEEPSEEK_V3, DEEPSEEK_V4_1_FLASH,
                                 DEEPSEEK_V4_1_FLASH_NVFP4,
@@ -440,6 +443,22 @@ class TestQuantisedForms(unittest.TestCase):
         self.assertEqual(DEEPSEEK_V4_1_FLASH.embedding_bytes(),
                          int(round(DEEPSEEK_V4_1_FLASH.vocab_size
                                    * DEEPSEEK_V4_1_FLASH.hidden_size * 2.0)))
+
+    def test_the_cli_pins_experts_when_only_weights_are_repacked(self):
+        """``--weights-quant`` alone repacks the hot weights, not the experts:
+        profiles that store both in one format (V3) keep their expert rate,
+        while ``with_quant`` keeps its field-swap semantics — unset
+        ``expert_weights`` still inherits ``weights``."""
+        args = argparse.Namespace(model="deepseek-v3",
+                                  weights_quant="gguf-q6_k",
+                                  experts_quant=None, io_quant=None,
+                                  kv_quant=None)
+        repacked = _profile_for_args(args)
+        self.assertEqual(repacked.weights, GGUF_Q6_K)
+        self.assertEqual(repacked.expert_quant, DEEPSEEK_V3.expert_quant)
+        # ...while a direct field swap on a uniform profile moves both.
+        inherited = with_quant(DEEPSEEK_V3, weights=GGUF_Q6_K)
+        self.assertEqual(inherited.expert_quant, GGUF_Q6_K)
 
     def test_kv_quant_reaches_every_attention_kind(self):
         """MLA and Hybrid both store their caches under ``kv_quant`` now —
