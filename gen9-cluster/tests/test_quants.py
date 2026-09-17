@@ -397,8 +397,8 @@ class TestPackedShardLoading(unittest.TestCase):
 
     def test_an_fp8_tile_shard_decodes_with_its_tile_geometry(self):
         """V4.1's ue8m0-per-32x32-tile scales: the wire dtype carries the
-        geometry, the loader upcasts the exponents, and dequantisation is
-        per tile, not per flat 128."""
+        geometry, the exponents stay one byte each in the coffer, and
+        dequantisation is per tile, not per flat 128."""
         rng = np.random.default_rng(11)
         codes = rng.integers(0, 128, size=(3, INTERMEDIATE, HIDDEN),
                              dtype=np.uint8)
@@ -409,8 +409,12 @@ class TestPackedShardLoading(unittest.TestCase):
         self.assertEqual(reply.msg_type, MsgType.LOAD_ACK)
         held = self.store.get(1, 0)
         self.assertTrue(held.quantised)
-        self.assertEqual(held.format, "fp8-e4m3-tile")
+        self.assertEqual(held.format, "fp8-e4m3-tile-ue8m0")
         self.assertEqual(held.scale_tile, (32, 32))
+        # One-byte exponents stay one byte: the shard's residency is its
+        # wire size, not a 4x fp32 expansion of the scale run.
+        self.assertEqual(held.scales.dtype, np.uint8)
+        self.assertEqual(held.nbytes, len(body))
         scales = np.ldexp(
             np.ones(ue.shape, dtype=np.float32),
             ue.astype(np.int16) - 127)

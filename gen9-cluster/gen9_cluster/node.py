@@ -70,8 +70,10 @@ class ExpertWeights:
     #: The storage encoding: "fp32" for an ordinary buffer, "fp16"/"bf16"
     #: for a dense shard kept at its wire width, "fp8-e4m3-b128" for FP8
     #: codes whose scales live in ``scales``, "fp8-e4m3-tile" for the
-    #: tile-scaled FP8 layouts, or a :mod:`gen9_cluster.quants` block format
-    #: whose scales are packed into the blocks themselves.
+    #: tile-scaled FP8 layouts with fp32 scales, "fp8-e4m3-tile-ue8m0" for
+    #: the same with one-byte exponent scales, or a
+    #: :mod:`gen9_cluster.quants` block format whose scales are packed into
+    #: the blocks themselves.
     format: str = "fp32"
     #: (rows, cols) one scale covers, for the tile-scaled FP8 encodings.
     #: None is the flat per-128 layout of ``fp8-e4m3-b128``.
@@ -120,7 +122,8 @@ class ExpertWeights:
                     tier=self.tier)
             return self
         if self.scales is None and self.format not in (
-                "fp32", "fp8-e4m3-b128", "fp8-e4m3-tile"):
+                "fp32", "fp8-e4m3-b128", "fp8-e4m3-tile",
+                "fp8-e4m3-tile-ue8m0"):
             # A block-packed codec: scales live inside the blocks, and NVFP4
             # adds a per-matrix tensor scale on top.
             decoded = ExpertWeights(
@@ -133,7 +136,8 @@ class ExpertWeights:
                 decoded.up *= self.tensor_scale[1]
                 decoded.down *= self.tensor_scale[2]
             return decoded
-        if self.format not in ("fp32", "fp8-e4m3-b128", "fp8-e4m3-tile"):
+        if self.format not in ("fp32", "fp8-e4m3-b128", "fp8-e4m3-tile",
+                               "fp8-e4m3-tile-ue8m0"):
             raise ValueError(f"a {self.format} expert packs its scales into "
                              "the blocks; a separate scale array means the "
                              "shard is malformed")
@@ -144,7 +148,11 @@ class ExpertWeights:
         if self.scales is None:
             raise ValueError("a quantised expert carries neither a format "
                              "nor block scales; the shard is incomplete")
-        flat = np.asarray(self.scales, dtype=np.float32).reshape(-1)
+        # UE8M0 scales stay one byte each in the coffer — the whole point of
+        # the encoding is that footprint — and decode here, per use.
+        scales = (fp8.decode_ue8m0(self.scales)
+                  if self.format == "fp8-e4m3-tile-ue8m0" else self.scales)
+        flat = np.asarray(scales, dtype=np.float32).reshape(-1)
         if self.scale_tile is not None:
             counts = [fp8.tile_scales_needed(array.shape, self.scale_tile)
                       for array in (self.gate, self.up, self.down)]
@@ -609,9 +617,10 @@ class NodeServer:
         """An FP8 shard whose scales tile the 2-D matrices, not the flat run.
 
         Same codes-then-scales separation as the flat layout; the scale dtype
-        and tile shape come from the wire code. UE8M0 exponents are upcast to
-        fp32 here — a lossless one-time cost — so ``dequantised`` only ever
-        sees one scale representation.
+        and tile shape come from the wire code. Scales stay at wire width —
+        a one-byte UE8M0 exponent is one byte in the coffer too, because the
+        whole point of the encoding is that footprint; ``dequantised`` does
+        the lossless fp32 expansion per use instead.
         """
         tile = header.dtype.fp8_tile
         assert tile is not None
@@ -632,8 +641,8 @@ class NodeServer:
         codes = np.frombuffer(body, dtype=np.uint8, count=n_codes)
         raw_scales = np.frombuffer(body, dtype=scale_np, count=n_scales,
                                    offset=n_codes)
-        scales = (fp8.decode_ue8m0(raw_scales) if scale_np.itemsize == 1
-                  else np.asarray(raw_scales, dtype=np.float32))
+        scales = np.asarray(raw_scales)
+        ue8m0 = scale_np.itemsize == 1
         for index in range(header.n_experts):
             chunk = codes[index * per_expert:(index + 1) * per_expert]
             gate, up, down = np.split(chunk, 3)
@@ -648,7 +657,8 @@ class NodeServer:
                                       header.intermediate_size),
                     scales=scales[index * scales_per_expert:
                                   (index + 1) * scales_per_expert],
-                    format="fp8-e4m3-tile",
+                    format=("fp8-e4m3-tile-ue8m0" if ue8m0
+                            else "fp8-e4m3-tile"),
                     scale_tile=tile,
                     tier=header.tier))
 

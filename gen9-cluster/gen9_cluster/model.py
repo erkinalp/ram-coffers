@@ -109,7 +109,7 @@ QUANT_SPECS: Dict[str, QuantSpec] = {
     "fp32": QuantSpec("fp32"),
     "fp16": QuantSpec("fp16"),
     "bf16": QuantSpec("bf16"),
-    "fp8": QuantSpec("fp8"),
+    "fp8": QuantSpec("fp8", scale_bytes=4.0, scale_block=128),
     "fp8-block128": FP8_BLOCK128,
     "fp8-ue8m0": FP8_UE8M0,
     "fp8-ue8m0-32": FP8_UE8M0_32,
