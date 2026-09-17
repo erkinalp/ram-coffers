@@ -153,6 +153,11 @@ class AttentionConfig:
         """Cache this layer holds regardless of context length."""
         return 0
 
+    def cache_specs(self) -> Dict[str, "QuantSpec"]:
+        """The quantised pools this attention kind keeps — ``kv`` for every
+        kind, ``index`` where the architecture has one."""
+        return {}
+
     def kv_read_bytes(self, context_tokens: int, dtype: Optional[str] = None,
                       layer: int = 0) -> int:
         """Cache one decoded token has to *read* — not what it stores."""
@@ -173,6 +178,9 @@ class MLAConfig(AttentionConfig):
     #: Format of the cached latent. The decoupled RoPE key stays bf16 —
     #: checkpoints keep it precise regardless of the latent's format.
     kv_quant: QuantSpec = QuantSpec("fp8")
+
+    def cache_specs(self) -> Dict[str, QuantSpec]:
+        return {"kv": self.kv_quant}
 
     @property
     def qk_head_dim(self) -> int:
@@ -261,6 +269,9 @@ class HybridAttentionConfig(AttentionConfig):
     index_quant: QuantSpec = MXFP4
     #: Format of the cached KV entries; the RoPE dims stay bf16 either way.
     kv_quant: QuantSpec = QuantSpec("fp8")
+
+    def cache_specs(self) -> Dict[str, QuantSpec]:
+        return {"kv": self.kv_quant, "index": self.index_quant}
 
     def ratio(self, layer: int = 0) -> int:
         if not self.compress_ratios:
@@ -420,6 +431,9 @@ class CSA2Config(AttentionConfig):
     #: V4.1 caches the shared pools in FP4, not FP8.
     kv_quant: QuantSpec = FP4_E4M3_16
     index_quant: QuantSpec = FP4_E4M3_16
+
+    def cache_specs(self) -> Dict[str, QuantSpec]:
+        return {"kv": self.kv_quant, "index": self.index_quant}
 
     def ratio(self, layer: int = 0) -> int:
         if not self.compress_ratios:

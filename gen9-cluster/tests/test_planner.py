@@ -214,6 +214,32 @@ class TestPlacement(unittest.TestCase):
             self.assertEqual(record["first_row"], 0)
             self.assertEqual(record["n_rows"], engram.num_embeddings[table])
 
+    def test_the_deployment_names_every_pieces_wire_format(self):
+        """A coordinator loads shards from this config alone, so the format
+        cannot stop at planning: shard records carry their wire dtype and a
+        top-level map names the roles that travel without records."""
+        from gen9_cluster.model import DEEPSEEK_V4_1_FLASH_NVFP4
+        plan = plan_split(DEEPSEEK_V4_1_FLASH_NVFP4, ps5_fleet(24))
+        config = deployment_config(plan, [])
+        formats = config["formats"]
+        self.assertEqual(formats["weights"], "BF16")
+        self.assertEqual(formats["io"], "BF16")
+        self.assertEqual(formats["routed_experts"], "NVFP4")
+        self.assertEqual(formats["shared_experts"], "BF16")
+        self.assertEqual(formats["draft_routed_experts"], "BF16")
+        self.assertEqual(formats["draft_shared_experts"], "BF16")
+        backbone, draft = set(), set()
+        for node in config["nodes"].values():
+            for shard in node["shards"]:
+                (draft if shard["layer"] >= DEEPSEEK_V4_1_FLASH_NVFP4.n_layers
+                 else backbone).add(shard["dtype"])
+            for shard in node["engram_shards"]:
+                self.assertEqual(shard["dtype"], "BF16")
+        self.assertTrue(backbone)
+        self.assertTrue(draft)
+        self.assertEqual(backbone, {"NVFP4"})
+        self.assertEqual(draft, {"BF16"})
+
     def test_ram_sharded_engram_counts_its_holders_per_token(self):
         """A RAM-sharded lookup fans out to every holder, so the per-token
         console count has to include them — hash addressing means the rows a

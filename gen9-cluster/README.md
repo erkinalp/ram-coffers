@@ -259,7 +259,7 @@ rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 
 **Measured** (on this x86-64 build host, not a console): the CPU kernel at
 67 GFLOP/s and 134 GB/s effective; the SPIR-V shader compiles and passes
-`spirv-val`; 266 Python tests pass, including the protocol, transport, dispatch
+`spirv-val`; 267 Python tests pass, including the protocol, transport, dispatch
 and coordinator paths over real loopback sockets.
 
 **Estimated**: every throughput figure for a console. They come from datasheet
@@ -292,7 +292,7 @@ See [docs/GEN9_SPLITTING.md](docs/GEN9_SPLITTING.md) for the arithmetic and
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 266 tests
+python3 -m unittest discover -s tests -t .   # 267 tests
 cd kernels && make && make test              # CPU kernel + FP8 conformance
 make vulkan                                  # needs glslang-tools
 make hip                                     # needs hipcc; skipped otherwise

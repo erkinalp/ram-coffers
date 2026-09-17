@@ -216,6 +216,7 @@ def deployment_config(plan, fleet: Sequence[FleetEntry]) -> Dict:
         "model_assumed": plan.model_assumed,
         "context_tokens": plan.context_tokens,
         "estimated_tokens_per_second": round(plan.tokens_per_second, 3),
+        "formats": dict(plan.formats),
         "shelves": [stage.to_dict() for stage in plan.stages],
         "nodes": {},
     }
