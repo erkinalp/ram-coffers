@@ -165,8 +165,11 @@ question they change is how many consoles the residency fits on — the
 arithmetic itself is untouched, because every piece in the plan already sizes
 off the `QuantSpec` it lives under. Three shapes of fork exist:
 
-- **A repack.** NVFP4 builds put every linear weight at ~0.59 B/param and
-  land as a derived profile (`deepseek-v4.1-flash-nvfp4`, floor 37 RAM-only).
+- **A repack.** NVIDIA's NVFP4 build quantizes only the routed experts —
+  attention, shared experts, MTP, head, and embeddings stay bf16 in its
+  `hf_quant_config.json` — so `deepseek-v4.1-flash-nvfp4` is experts-NVFP4
+  over a bf16 backbone (floor 61 RAM-only; an all-linear NVFP4 repack is a
+  recipe instead, `--weights-quant nvfp4 --experts-quant nvfp4`).
 - **A recipe.** GGUF/EXL3/MLX builds mix formats per tensor class — q6_k over
   q2_k is the usual shape — so they compose at plan time via `with_quant`
   or the `--weights-quant`/`--experts-quant`/`--io-quant`/`--kv-quant` flags

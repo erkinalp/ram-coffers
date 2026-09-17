@@ -1154,14 +1154,18 @@ DEEPSEEK_V4_1_FLASH_REAP_272E = replace(
     moe=replace(DEEPSEEK_V4_1_FLASH.moe, n_routed_experts=272),
     source="LibertAIDAI/DeepSeek-V4.1-Flash-REAP-272E config.json")
 
-#: NVIDIA's NVFP4 build of V4.1-Flash (nvidia/AtomicChat/s-zaizen forks):
-#: the same checkpoint with all linear weights — routed experts included —
-#: at NVFP4 instead of the FP8/FP4 split. The FP4 cache formats are a
-#: serving choice and stay as the card ships them.
+#: NVIDIA's NVFP4 build of V4.1-Flash. Its hf_quant_config.json quantizes
+#: *only* the routed experts — ``*.attn.*``, ``*.ffn.shared_experts.*``,
+#: ``head``, and ``mtp.*`` are all in the ignore list — so hot weights,
+#: i/o, the Engram tables, and the draft blocks stay bf16. ``expert_weights``
+#: covers the draft experts too, a small over-quantisation the config
+#: refuses; a per-block expert field would be the only fix. A hypothetical
+#: all-linear NVFP4 build is a recipe, ``--weights-quant nvfp4
+#: --experts-quant nvfp4``, not this profile.
 DEEPSEEK_V4_1_FLASH_NVFP4 = replace(
     DEEPSEEK_V4_1_FLASH, name="deepseek-v4.1-flash-nvfp4",
-    weights=NVFP4, expert_weights=NVFP4,
-    source="nvidia/DeepSeek-V4.1-Flash-NVFP4 family")
+    weights=QUANT_SPECS["bf16"], expert_weights=NVFP4,
+    source="nvidia/DeepSeek-V4.1-Flash-NVFP4 hf_quant_config.json")
 
 
 #: A small MoE with the same architecture, for a fleet of two or three consoles

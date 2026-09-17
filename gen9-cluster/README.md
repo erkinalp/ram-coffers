@@ -58,14 +58,18 @@ reads. Nothing in this repository has run on a console yet.
 | `deepseek-v4.1-flash` | 566 B + 197 B aux | 16 B (8 B prefill) | 468 GiB | 43 |
 | `deepseek-v4.1-flash-reap-256e` | 385 B + 197 B aux | 16 B | 378 GiB | 35 |
 | `deepseek-v4.1-flash-reap-272e` | 407 B + 197 B aux | 16 B | 390 GiB | 36 |
-| `deepseek-v4.1-flash-nvfp4` | 566 B + 197 B aux | 16 B | 401 GiB | 37 |
+| `deepseek-v4.1-flash-nvfp4` | 566 B + 197 B aux | 16 B | 673 GiB | 61 |
 | `deepseek-v3` | 683 B | 37 B | 638 GiB | 58 |
 | `deepseek-tiny` | — | — | 0.5 GiB | 1 (CI only) |
 
 The V4.1 variants are the community forks that change the placement math:
 REAP-256E/272E prune the routed pool to 256/272 of 384 experts (same FP8/FP4
-packing, same top-6 — pruning moves residency, not speed), and the NVFP4
-builds repack every linear weight at ~0.59 B/param. Any other recipe —
+packing, same top-6 — pruning moves residency, not speed), and NVIDIA's
+NVFP4 build quantizes *only* the routed experts — attention, shared
+experts, MTP blocks, head, and embeddings stay bf16 per its
+`hf_quant_config.json`, which is why it lands heavier than the base. A
+hypothetical all-linear NVFP4 repack is a recipe, not a profile. Any other
+recipe —
 GGUF's usual q6_k-over-q2_k mixes, EXL3-style sub-4-bit experts — composes
 at plan time rather than as a profile:
 
@@ -250,7 +254,7 @@ rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 
 **Measured** (on this x86-64 build host, not a console): the CPU kernel at
 67 GFLOP/s and 134 GB/s effective; the SPIR-V shader compiles and passes
-`spirv-val`; 243 Python tests pass, including the protocol, transport, dispatch
+`spirv-val`; 247 Python tests pass, including the protocol, transport, dispatch
 and coordinator paths over real loopback sockets.
 
 **Estimated**: every throughput figure for a console. They come from datasheet
@@ -283,7 +287,7 @@ See [docs/GEN9_SPLITTING.md](docs/GEN9_SPLITTING.md) for the arithmetic and
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 232 tests
+python3 -m unittest discover -s tests -t .   # 247 tests
 cd kernels && make && make test              # CPU kernel + FP8 conformance
 make vulkan                                  # needs glslang-tools
 make hip                                     # needs hipcc; skipped otherwise

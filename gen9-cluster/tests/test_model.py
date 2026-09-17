@@ -393,10 +393,18 @@ class TestQuantisedForms(unittest.TestCase):
         uses the same 0.5625 figure it already models for the KV cache."""
         self.assertEqual(NVFP4.bytes_per_param, 0.5625)
         self.assertEqual(NVFP4, FP4_E4M3_16)
-        self.assertEqual(
-            DEEPSEEK_V4_1_FLASH_NVFP4.expert_quant, NVFP4)
-        self.assertEqual(
-            DEEPSEEK_V4_1_FLASH_NVFP4.weights, NVFP4)
+
+    def test_the_nvfp4_checkpoint_quantizes_only_the_routed_experts(self):
+        """nvidia's hf_quant_config.json lists only ``layers.*.ffn.experts``
+        as NVFP4 — attention, shared experts, mtp, and head are all in the
+        ignore list — so the profile is experts-NVFP4 over a bf16 backbone,
+        not an all-linear repack."""
+        profile = DEEPSEEK_V4_1_FLASH_NVFP4
+        self.assertEqual(profile.expert_quant, NVFP4)
+        self.assertEqual(profile.weights, QUANT_SPECS["bf16"])
+        self.assertEqual(profile.io_spec, QUANT_SPECS["bf16"])
+        self.assertGreater(profile.total_bytes(),
+                           DEEPSEEK_V4_1_FLASH.total_bytes())
 
     def test_with_quant_repacks_the_pieces_it_names(self):
         repacked = with_quant(DEEPSEEK_V4_1_FLASH, weights=GGUF_Q6_K,

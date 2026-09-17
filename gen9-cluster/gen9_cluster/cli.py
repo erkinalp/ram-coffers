@@ -67,6 +67,10 @@ def _profile_for_args(args: argparse.Namespace) -> ModelProfile:
     expert_weights = (QUANT_SPECS[args.experts_quant]
                       if args.experts_quant else
                       (profile.expert_quant if args.weights_quant else None))
+    # A repacked checkpoint is not the checkpoint: the recipe goes in the
+    # profile's name so plans, deployment metadata, and fleet configs can
+    # tell two quantised placements of the same base apart.
+    note = _quant_note(args)
     return with_quant(
         profile,
         weights=(QUANT_SPECS[args.weights_quant]
@@ -74,7 +78,8 @@ def _profile_for_args(args: argparse.Namespace) -> ModelProfile:
         expert_weights=expert_weights,
         io_quant=(QUANT_SPECS[args.io_quant] if args.io_quant else None),
         kv_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None),
-        index_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None))
+        index_quant=(QUANT_SPECS[args.kv_quant] if args.kv_quant else None),
+        name=f"{profile.name}~{note.replace(', ', ',')}" if note else None)
 
 
 def _quant_note(args: argparse.Namespace) -> str:
@@ -243,7 +248,9 @@ def cmd_health(args: argparse.Namespace) -> int:
     fleet = load_fleet(Path(args.fleet))
     profile = _profile_for_args(args)
     plan = plan_split(profile, units(fleet), context_tokens=args.context,
-                      shelf_size=args.shelf_size)
+                      shelf_size=args.shelf_size,
+                      allow_ssd_tier=not args.no_ssd,
+                      hop_seconds=args.hop_ms / 1000.0)
 
     def router(layer, state):
         k = profile.moe.top_k
