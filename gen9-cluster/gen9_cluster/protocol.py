@@ -99,25 +99,102 @@ class DType(enum.IntEnum):
     FP16 = 1
     BF16 = 2
     #: FP8 E4M3 with one fp32 scale per 128 elements, as DeepSeek ships it.
+    #: The wire keeps codes and scales as separate runs; block-packed formats
+    #: below interleave their scales inside each block instead.
     FP8_E4M3_B128 = 3
+    #: OCP MXFP4: E2M1 nibbles, one E8M0 scale per 32 elements (17 B blocks).
+    MXFP4 = 4
+    #: E2M1 nibbles, one UE4M3 sub-scale per 16 elements, four sub-blocks per
+    #: 64-element block — the GGUF NVFP4 layout (36 B blocks).
+    FP4_E4M3_16 = 5
+    #: The GGUF superblock formats, in their exact published layouts.
+    GGUF_Q8_0 = 6
+    GGUF_Q2_K = 7
+    GGUF_Q3_K = 8
+    GGUF_Q4_K = 9
+    GGUF_Q5_K = 10
+    GGUF_Q6_K = 11
 
     @property
     def itemsize(self) -> float:
+        """Bytes per element, including scale overhead for packed formats."""
         return {DType.FP32: 4.0, DType.FP16: 2.0, DType.BF16: 2.0,
-                DType.FP8_E4M3_B128: 1.0}[self]
+                DType.FP8_E4M3_B128: 1.0,
+                DType.MXFP4: 17.0 / 32,
+                DType.FP4_E4M3_16: 36.0 / 64,
+                DType.GGUF_Q8_0: 34.0 / 32,
+                DType.GGUF_Q2_K: 84.0 / 256,
+                DType.GGUF_Q3_K: 110.0 / 256,
+                DType.GGUF_Q4_K: 144.0 / 256,
+                DType.GGUF_Q5_K: 176.0 / 256,
+                DType.GGUF_Q6_K: 210.0 / 256}[self]
 
     @property
     def numpy(self) -> np.dtype:
         """The numpy view of the *payload* bytes.
 
-        BF16 and FP8 have no portable numpy dtype, so they travel as raw bytes
-        and are converted by the kernel; the tests exercise the fp32 path, which
-        is what the reference worker uses.
+        BF16, FP8 and every block-packed format have no portable numpy
+        dtype, so they travel as raw bytes and are converted by the kernel
+        or by :mod:`gen9_cluster.quants`; the tests exercise the fp32 path,
+        which is what the reference worker uses.
         """
+        if self in _PACKED_DTYPES:
+            return np.dtype("u1")
         names: Dict["DType", str] = {DType.FP32: "<f4", DType.FP16: "<f2",
                                      DType.BF16: "<u2",
                                      DType.FP8_E4M3_B128: "u1"}
         return np.dtype(names[self])
+
+    @property
+    def packed(self) -> bool:
+        """Whether the payload is a run of self-contained scale blocks."""
+        return self in _PACKED_DTYPES
+
+    @property
+    def codec(self) -> str:
+        """The :mod:`gen9_cluster.quants` format name, for packed dtypes."""
+        names: Dict["DType", str] = {
+            DType.MXFP4: "mxfp4",
+            DType.FP4_E4M3_16: "fp4",
+            DType.GGUF_Q8_0: "q8_0",
+            DType.GGUF_Q2_K: "q2_k",
+            DType.GGUF_Q3_K: "q3_k",
+            DType.GGUF_Q4_K: "q4_k",
+            DType.GGUF_Q5_K: "q5_k",
+            DType.GGUF_Q6_K: "q6_k"}
+        return names[self]
+
+    @classmethod
+    def for_spec(cls, spec_dtype: str) -> "DType":
+        """The wire dtype carrying a ``QuantSpec.dtype``.
+
+        The planner's ``fp8`` rates are approximations (ue8m0 or no scales);
+        the wire has a single FP8 container — fp32 scales per 128 elements —
+        and every fp8 spec maps onto it, slightly overstating scale bytes
+        rather than inventing a second wire format. ``fp4`` maps to the
+        NVFP4 packing, which is what both ``fp4-e4m3-16`` and ``nvfp4`` mean.
+        """
+        names: Dict[str, "DType"] = {
+            "fp32": cls.FP32, "fp16": cls.FP16, "bf16": cls.BF16,
+            "fp8": cls.FP8_E4M3_B128,
+            "mxfp4": cls.MXFP4,
+            "fp4": cls.FP4_E4M3_16,
+            "q8_0": cls.GGUF_Q8_0,
+            "q2_k": cls.GGUF_Q2_K, "q3_k": cls.GGUF_Q3_K,
+            "q4_k": cls.GGUF_Q4_K, "q5_k": cls.GGUF_Q5_K,
+            "q6_k": cls.GGUF_Q6_K}
+        try:
+            return names[spec_dtype]
+        except KeyError:
+            raise ValueError(f"no wire dtype for quant dtype "
+                             f"{spec_dtype!r}") from None
+
+
+#: DTypes whose payload is a run of fixed-size blocks with their scales
+#: interleaved; decoded by :mod:`gen9_cluster.quants`.
+_PACKED_DTYPES = frozenset({DType.MXFP4, DType.FP4_E4M3_16,
+                            DType.GGUF_Q8_0, DType.GGUF_Q2_K, DType.GGUF_Q3_K,
+                            DType.GGUF_Q4_K, DType.GGUF_Q5_K, DType.GGUF_Q6_K})
 
 
 class Flags(enum.IntFlag):

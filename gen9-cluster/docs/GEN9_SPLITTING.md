@@ -180,6 +180,12 @@ off the `QuantSpec` it lives under. Three shapes of fork exist:
   changes nothing else; `deepseek-v4.1-flash-reap-*` are derived profiles
   with the smaller `n_routed_experts` and floors of 35/36 RAM-only.
 
+The runtime carries the same formats the planner names: `LOAD_SHARD` takes
+the GGUF superblocks, mxfp4 and fp4 as block-packed bodies
+(`gen9_cluster/quants.py` decodes them to fp32 per use, scales packed inside
+each block), and every `QuantSpec.dtype` maps to a wire dtype via
+`DType.for_spec`.
+
 The floor drops from 83 PS5s (V4 Pro, RAM-only) to **43** — the ~183 GiB of
 Engram rows shard across fleet RAM when no drives are allowed — and to **24**
 with the SSD tier on, one more than V4 Pro's 23.

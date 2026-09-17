@@ -240,7 +240,11 @@ over persistent TCP with Nagle off, and one message per *console* per layer
 rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 
 - `node.py` — the console-side worker: shard store (RAM or mmap'd NVMe),
-  expert execution, block forwarding.
+  expert execution, block forwarding. Shards load dense (fp32/fp16/bf16),
+  FP8-with-scales, or block-packed (GGUF quants, mxfp4, fp4) — the packed
+  formats stay packed in the coffer and dequantise per use.
+- `quants.py` — the numpy decoders for the block-packed formats, ported from
+  the published ggml layouts; the same job `fp8.py` does for FP8.
 - `dispatch.py` — groups a token's experts by console, one batched request each,
   reduces the per-expert replies in the router's top-k order so the same prompt
   gives the same token *whatever console holds which expert*, and fails over to
@@ -254,7 +258,7 @@ rather than one per expert. See [docs/G9XC.md](docs/G9XC.md).
 
 **Measured** (on this x86-64 build host, not a console): the CPU kernel at
 67 GFLOP/s and 134 GB/s effective; the SPIR-V shader compiles and passes
-`spirv-val`; 247 Python tests pass, including the protocol, transport, dispatch
+`spirv-val`; 263 Python tests pass, including the protocol, transport, dispatch
 and coordinator paths over real loopback sockets.
 
 **Estimated**: every throughput figure for a console. They come from datasheet
@@ -287,7 +291,7 @@ See [docs/GEN9_SPLITTING.md](docs/GEN9_SPLITTING.md) for the arithmetic and
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 247 tests
+python3 -m unittest discover -s tests -t .   # 263 tests
 cd kernels && make && make test              # CPU kernel + FP8 conformance
 make vulkan                                  # needs glslang-tools
 make hip                                     # needs hipcc; skipped otherwise

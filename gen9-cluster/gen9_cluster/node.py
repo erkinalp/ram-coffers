@@ -39,7 +39,7 @@ from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
-from . import fp8
+from . import fp8, quants
 from .dedup import (DedupCache, DedupCapacityError, MismatchedBatchError,
                     batch_fingerprint)
 from .errors import CapacityError, ShardMissing
@@ -56,16 +56,22 @@ ExpertKey = Tuple[int, int]
 class ExpertWeights:
     """One routed expert: gate, up, down.
 
-    Stored as whatever numpy dtype the loader produced. FP8 shards arrive as
-    ``uint8`` plus a scale array and are dequantised by the kernel, so the
-    reference runner up-converts them once here rather than pretending numpy
-    speaks E4M3.
+    Stored as whatever the loader produced. FP8 shards arrive as ``uint8``
+    plus a scale array and are dequantised by the kernel, and block-packed
+    formats (GGUF quants, mxfp4, fp4) arrive as runs of scale-interleaved
+    blocks; the reference runner up-converts either kind once per call rather
+    than pretending numpy speaks them.
     """
 
     gate: np.ndarray
     up: np.ndarray
     down: np.ndarray
     scales: Optional[np.ndarray] = None
+    #: The storage encoding: "fp32" for an ordinary buffer,
+    #: "fp8-e4m3-b128" for FP8 codes whose scales live in ``scales``, or a
+    #: :mod:`gen9_cluster.quants` block format whose scales are packed into
+    #: the blocks themselves.
+    format: str = "fp32"
     #: "fast" | "slow" | "ssd" — which coffer this came out of.
     tier: str = "fast"
 
@@ -89,6 +95,24 @@ class ExpertWeights:
         """
         if not self.quantised:
             return self
+        if self.scales is None and self.format != "fp8-e4m3-b128":
+            if self.format == "fp32":
+                raise ValueError("a quantised expert carries neither a "
+                                 "format nor block scales; the shard is "
+                                 "incomplete")
+            return ExpertWeights(
+                gate=quants.dequantize_rows(self.gate, self.format),
+                up=quants.dequantize_rows(self.up, self.format),
+                down=quants.dequantize_rows(self.down, self.format),
+                tier=self.tier)
+        if self.format not in ("fp32", "fp8-e4m3-b128"):
+            raise ValueError(f"a {self.format} expert packs its scales into "
+                             "the blocks; a separate scale array means the "
+                             "shard is malformed")
+        # ``scales`` present, or an explicitly FP8 shard: the classic
+        # codes-then-scales layout. (Experts built ad-hoc with uint8 codes
+        # and a scale array — the format field left at its default — are
+        # this too.)
         if self.scales is None:
             raise ValueError("an FP8 expert without block scales cannot be "
                              "decoded; the shard is incomplete")
@@ -404,32 +428,44 @@ class NodeServer:
         try:
             if header.dtype is DType.FP8_E4M3_B128:
                 self._load_fp8(header, body)
+            elif header.dtype.packed:
+                self._load_packed(header, body)
             else:
-                self._load_f32(header, body)
+                self._load_dense(header, body)
         except ValueError as exc:
             return self._error(frame, str(exc))
         return Frame(MsgType.LOAD_ACK, frame.request_id, layer=header.layer,
                      expert=header.first_expert, dtype=header.dtype)
 
-    def _load_f32(self, header: ShardHeader, body: bytes) -> None:
+    def _load_dense(self, header: ShardHeader, body: bytes) -> None:
+        """A dense shard: fp32, fp16 or bf16, decoded to fp32 at load.
+
+        Dense formats carry no scales, so there is nothing to keep packed —
+        the fp32 up-conversion happens once here instead of per token.
+        """
         per_expert = 3 * header.hidden_size * header.intermediate_size
-        array = np.frombuffer(body, dtype="<f4")
+        array = np.frombuffer(body, dtype=header.dtype.numpy)
         expected = header.n_experts * per_expert
         if array.size != expected:
-            raise ValueError(f"shard body has {array.size} floats, "
-                             f"expected {expected}")
+            raise ValueError(f"shard body has {array.size} {header.dtype.name} "
+                             f"elements, expected {expected}")
+        dtype_name = {DType.FP32: "fp32", DType.FP16: "fp16",
+                      DType.BF16: "bf16"}[header.dtype]
         for index in range(header.n_experts):
             chunk = array[index * per_expert:(index + 1) * per_expert]
             gate, up, down = np.split(chunk, 3)
             self.store.put(
                 header.layer, header.first_expert + index,
                 ExpertWeights(
-                    gate=gate.reshape(header.intermediate_size,
-                                      header.hidden_size),
-                    up=up.reshape(header.intermediate_size,
-                                  header.hidden_size),
-                    down=down.reshape(header.hidden_size,
-                                      header.intermediate_size),
+                    gate=quants.decode_dense(
+                        gate.reshape(header.intermediate_size,
+                                     header.hidden_size), dtype_name),
+                    up=quants.decode_dense(
+                        up.reshape(header.intermediate_size,
+                                   header.hidden_size), dtype_name),
+                    down=quants.decode_dense(
+                        down.reshape(header.hidden_size,
+                                     header.intermediate_size), dtype_name),
                     tier=header.tier))
 
     def _load_fp8(self, header: ShardHeader, body: bytes) -> None:
@@ -468,6 +504,44 @@ class NodeServer:
                                       header.intermediate_size),
                     scales=scales[index * blocks_per_expert:
                                   (index + 1) * blocks_per_expert],
+                    format="fp8-e4m3-b128",
+                    tier=header.tier))
+
+    def _load_packed(self, header: ShardHeader, body: bytes) -> None:
+        """A block-packed shard: GGUF blocks, mxfp4 or fp4, kept packed.
+
+        The layout mirrors the dense and FP8 paths — per expert, gate then
+        up then down, each matrix packed row by row — but the bytes stay in
+        their blocks: the whole point of these formats is the footprint, and
+        decoding at load would give it back. Each matrix's row width must
+        divide the block size; a shape that cannot is a plan/checkpoint
+        mismatch worth refusing loudly.
+        """
+        codec = header.dtype.codec
+        hidden_row = quants.block_bytes_per_row(header.hidden_size, codec)
+        inter_row = quants.block_bytes_per_row(header.intermediate_size, codec)
+        gate_bytes = header.intermediate_size * hidden_row
+        down_bytes = header.hidden_size * inter_row
+        per_expert = 2 * gate_bytes + down_bytes
+        expected = header.n_experts * per_expert
+        if len(body) != expected:
+            raise ValueError(f"{codec} shard body is {len(body)} bytes, "
+                             f"expected {expected}")
+        for index in range(header.n_experts):
+            base = index * per_expert
+            gate = np.frombuffer(body, dtype=np.uint8, count=gate_bytes,
+                                 offset=base)
+            up = np.frombuffer(body, dtype=np.uint8, count=gate_bytes,
+                               offset=base + gate_bytes)
+            down = np.frombuffer(body, dtype=np.uint8, count=down_bytes,
+                                 offset=base + 2 * gate_bytes)
+            self.store.put(
+                header.layer, header.first_expert + index,
+                ExpertWeights(
+                    gate=gate.reshape(header.intermediate_size, hidden_row),
+                    up=up.reshape(header.intermediate_size, hidden_row),
+                    down=down.reshape(header.hidden_size, inter_row),
+                    format=codec,
                     tier=header.tier))
 
     def _on_ping(self, frame: Frame) -> Frame:
